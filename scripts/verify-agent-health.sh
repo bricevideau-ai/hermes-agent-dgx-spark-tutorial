@@ -22,6 +22,7 @@ HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
 CONFIG="$HERMES_HOME/config.yaml"
 # Account root = parent of .hermes (works under sudo where $HOME would be root's).
 ACCT_HOME="$(dirname "$HERMES_HOME")"
+acct_user="$(basename "$ACCT_HOME")"
 JSON=0
 [[ "${1:-}" == "--json" ]] && JSON=1
 
@@ -46,9 +47,15 @@ fi
 # AXIS 1 — Model / provider block
 # ---------------------------------------------------------------------------
 [[ $JSON -eq 0 ]] && echo "--- Axis 1: model/provider ---"
-default_model="$(grep -E '^\s*default:' "$CONFIG" | head -1 | sed 's/.*default:\s*//')"
-base_url="$(grep -E '^\s*base_url:' "$CONFIG" | head -1 | sed 's/.*base_url:\s*//')"
-api_key="$(grep -E '^\s*api_key:' "$CONFIG" | head -1 | sed 's/.*api_key:\s*//')"
+# Anchor to the top-level `model:` block. Blind `grep default: | head -1` is fragile —
+# reorder the config and it silently grabs auxiliary.default or a memory sub-key.
+# Pull the lines under `model:` up to the next top-level key, then read from those.
+model_block="$(awk '/^model:/{f=1;next} /^[A-Za-z_]/{f=0} f' "$CONFIG")"
+default_model="$(grep -E '^\s*default:' <<<"$model_block" | head -1 | sed 's/.*default:\s*//')"
+base_url="$(grep -E '^\s*base_url:' <<<"$model_block" | head -1 | sed 's/.*base_url:\s*//')"
+api_key="$(grep -E '^\s*api_key:' <<<"$model_block" | head -1 | sed 's/.*api_key:\s*//')"
+# Fallback: if the model block yielded nothing (unusual layout), fall back to first match.
+[[ -z "$default_model" ]] && default_model="$(grep -E '^\s*default:' "$CONFIG" | head -1 | sed 's/.*default:\s*//')"
 
 if [[ -z "$default_model" ]]; then
   bad model.default "model.default is empty"
@@ -78,8 +85,8 @@ if [[ -n "$mem_provider" ]]; then
   # PASS during the original silently-broken state. So probe FUNCTION: ask Hermes
   # itself whether the memory backend is installed AND available.
   # Run as the owning account when we're inspecting a different agent's home.
-  if [[ "$acct_user_early" != "$(id -un)" ]]; then
-    mem_status="$(sudo -u "$acct_user_early" -H bash -lc 'timeout 60 hermes memory status 2>/dev/null')"
+  if [[ "$acct_user" != "$(id -un)" ]]; then
+    mem_status="$(sudo -u "$acct_user" -H bash -lc 'timeout 60 hermes memory status 2>/dev/null')"
   else
     mem_status="$(timeout 60 hermes memory status 2>/dev/null)"
   fi
@@ -162,11 +169,18 @@ if [[ -f "$gw_log" ]]; then
 else
   warn gw.ready "no gateway.log at $gw_log — cannot confirm Discord READY"
 fi
-# Discord permission wall (MANAGE_MESSAGES / 50013) — an OAuth-invite-scope problem, not a config fix.
-if grep -qiE 'Discord API .*403|code.*50013|Missing Permissions' "$HERMES_HOME"/logs/errors.log 2>/dev/null; then
+# Discord permission wall (MANAGE_MESSAGES / 50013). NOTE: grepping errors.log for
+# absence-of-error is NOT proof the permission exists — the log rotates/clears, and a
+# fresh/empty log would then falsely report PASS. So: if a 50013 is present -> FAIL
+# (hard evidence of the gap); if the log is missing/empty -> WARN (cannot confirm),
+# never PASS. Authoritative check is the bot's role bitfield via the Discord API.
+err_log="$HERMES_HOME/logs/errors.log"
+if [[ ! -s "$err_log" ]]; then
+  warn gw.perms "errors.log missing/empty — cannot confirm Discord perms from logs (query the bot role bitfield via API to be sure)"
+elif grep -qiE 'Discord API .*403|code.*50013|Missing Permissions' "$err_log" 2>/dev/null; then
   bad gw.perms "Discord 403 Missing Permissions (50013) seen — bot role lacks perms (fix via OAuth invite scope, not config)"
 else
-  ok gw.perms "no Discord permission (50013) errors in errors.log"
+  warn gw.perms "no 50013 in errors.log — but absence-of-error != permission present; confirm via bot role bitfield (Discord API) for a true PASS"
 fi
 
 # ---------------------------------------------------------------------------
