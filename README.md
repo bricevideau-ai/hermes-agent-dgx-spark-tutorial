@@ -320,15 +320,13 @@ has memory and every recall silently returns nothing. You must confirm both.
 
 ### 9.2 Install into the Hermes venv (not system Python)
 
-Everything must land in the **agent's own** Hermes virtualenv. On this box that is
-`~/.hermes/hermes-agent/venv` — confirm yours before installing:
+Everything must land in the **agent's own** Hermes virtualenv — on this box that is
+`~/.hermes/hermes-agent/venv`. Activate it explicitly (the `~/.local/bin/hermes` launcher is a
+wrapper script, **not** a symlink, so don't try to derive the venv from it — activate the known path):
 
 ```bash
-# Find and activate the Hermes venv (the path Hermes' own launcher uses):
-HERMES_VENV="$(dirname "$(dirname "$(readlink -f "$(command -v hermes)")")")"
-# On our box this resolves to ~/.hermes/hermes-agent/venv
-source "$HERMES_VENV/bin/activate"
-python -c "import sys; print(sys.executable)"   # sanity: should be under ~/.hermes/.../venv
+source ~/.hermes/hermes-agent/venv/bin/activate
+python -c "import sys; print(sys.executable)"   # sanity: should print a path under ~/.hermes/.../venv
 
 pip install mnemosyne-memory      # the engine + `mnemosyne` CLI
 pip install mnemosyne-hermes      # the Hermes bridge (provides the mnemosyne_hermes module)
@@ -338,40 +336,80 @@ mnemosyne-install                 # relinks the Hermes plugin symlink so Hermes 
 > **Version note (this box, validated):** `mnemosyne-memory 3.14.0` + `mnemosyne-hermes 0.5.0`.
 > `mnemosyne-install` lives inside the venv; the `mnemosyne` CLI is exposed on `~/.local/bin`.
 
-### 9.3 Point Hermes at it and set global scope
+> **Restart after `mnemosyne-install` — or the change is invisible.** The relinked plugin symlink is
+> **not** picked up by an already-running process. If your gateway is up, restart it (and start a
+> fresh CLI session) *before* checking status, or `hermes memory status` will report stale state and
+> you'll think the install failed:
+> ```bash
+> systemctl --user restart hermes-gateway    # if running as a service; else just start a new session
+> ```
+
+### 9.3 Point Hermes at Mnemosyne and make recall survive across sessions
 
 ```bash
 hermes config set memory.provider mnemosyne
-# Store durable facts GLOBALLY so they survive across sessions even if an env flag is ever lost:
-hermes config set memory.mnemosyne.default_scope global
 ```
 
-`default_scope: global` is the belt-and-suspenders setting. Session-scoped rows are invisible to
-*other* sessions unless `MNEMOSYNE_CROSS_SESSION=1` is present in the process environment **at import
-time** — a genuinely surprising footgun. Setting the default scope to `global` sidesteps it for the
-durable facts you actually care about. (If you run the gateway as a service, also add
-`Environment=MNEMOSYNE_CROSS_SESSION=1` to the systemd unit — see the companion doc's
-[§3b](docs/spinning-up-a-second-agent.md#3b-cross-session-scoping-bug--recall-returns-0-in-live-sessions).)
+The subtle part is **cross-session recall**. A fact stored in one session is invisible to *other*
+sessions unless `MNEMOSYNE_CROSS_SESSION=1` is in the process environment **at import time**. This
+env var — not a config setting — is the load-bearing mechanism, and the cleanest,
+install-path-agnostic way to set it for the gateway is a **systemd drop-in** (a drop-in survives
+`hermes gateway install` regenerating the unit; editing the main unit directly gets clobbered):
 
-### 9.4 Verify the whole chain — don't trust the status line alone
+```bash
+mkdir -p ~/.config/systemd/user/hermes-gateway.service.d
+cat > ~/.config/systemd/user/hermes-gateway.service.d/10-mnemosyne-cross-session.conf <<'EOF'
+[Service]
+Environment="MNEMOSYNE_CROSS_SESSION=1"
+EOF
+systemctl --user daemon-reload && systemctl --user restart hermes-gateway   # same restart rule as 9.2
+```
+
+Prove it landed in the **live** process, not just the unit file:
+
+```bash
+tr '\0' '\n' < /proc/$(pgrep -u "$USER" -f hermes-gateway | head -1)/environ | grep MNEMOSYNE
+# expect: MNEMOSYNE_CROSS_SESSION=1
+```
+
+> **Belt-and-suspenders (optional): `default_scope: global`.** Storing durable facts at `scope=global`
+> makes them cross-session even if the env var is ever lost. But be warned this setting is
+> **inconsistent across install paths**: it lives in Mnemosyne's *own* `~/.hermes/mnemosyne/config.yaml`
+> (`default_scope:`), and whether `hermes config get memory.mnemosyne.default_scope` reflects it varies
+> from box to box (on some installs it returns the effective value, on others `Config key not set`
+> even while recall works fine via the env var). Treat the env-var drop-in above as the real fix and
+> `default_scope: global` as a bonus — don't rely on `hermes config get` to confirm it. See the
+> companion doc's
+> [§3b](docs/spinning-up-a-second-agent.md#3b-cross-session-scoping-bug--recall-returns-0-in-live-sessions)
+> and [§3c](docs/spinning-up-a-second-agent.md#3c-cli-store-defaults-to-session-scope).
+
+### 9.4 Verify the whole chain — prove recall, don't trust the status line
 
 ```bash
 # 1. Both the provider AND the plugin must report healthy:
 hermes memory status
 #    Expect:  Provider: mnemosyne   AND   Plugin: installed ✓ / Status: available ✓
-#    A "Plugin: NOT installed ✗" here means 9.2 didn't take — re-run pip install + mnemosyne-install.
+#    A "Plugin: NOT installed ✗" here means 9.2 didn't take — re-run pip install + mnemosyne-install,
+#    then RESTART (9.2) before re-checking.
 
-# 2. Round-trip a canary through the CLI and recall it from a FRESH agent session:
-mnemosyne store "canary-$(date +%s): memory round-trip works" --scope global
-hermes chat -q "Recall the canary fact you just stored."   # it should quote the canary back
-mnemosyne stats                                            # counts should include the canary
+# 2. Round-trip a canary and PROVE it comes back. `mnemosyne store` is positional
+#    (store <content> [source] [importance]) — there is NO --scope flag; don't add one.
+CANARY="canary-$(date +%s)"
+mnemosyne store "$CANARY: memory round-trip works"    # -> "Stored: <id>"
+mnemosyne recall "$CANARY"                            # MUST print the row back (id + content + score)
+hermes mnemosyne stats                               # count should have incremented
 ```
 
+The `mnemosyne recall` returning your canary row is the actual proof — a `store` that merely
+"doesn't error" is not a verified round-trip. To also confirm the *agent* (not just the CLI) can
+recall it, ask it in a session: `hermes chat -q "Recall the $CANARY fact."` — but note a bare CLI
+`hermes chat` runs in a different process env than the gateway, so if the CLI recalls it and the
+gateway doesn't, that's the cross-session/env-var boundary from §9.3, not a broken store.
+
 If `hermes memory status` is green but recall returns nothing, the usual culprits are: the bridge
-went into the wrong venv (9.2), the scope is `session` not `global` (9.3), or — for the gateway
-specifically — `MNEMOSYNE_CROSS_SESSION` isn't in the *live process* env. The companion doc walks
-each of these three independent breaks with a proof step:
-[§3 Memory (Mnemosyne) — the three-way break](docs/spinning-up-a-second-agent.md#3-memory-mnemosyne--the-three-way-break).
+went into the wrong venv (§9.2), no restart after install (§9.2), or `MNEMOSYNE_CROSS_SESSION` isn't
+in the *live gateway process* env (§9.3). The companion doc walks each independent break with a proof
+step: [§3 Memory (Mnemosyne) — the three-way break](docs/spinning-up-a-second-agent.md#3-memory-mnemosyne--the-three-way-break).
 
 ---
 
@@ -412,18 +450,21 @@ The skill drives OAuth step-by-step so it works over SSH/Discord/Telegram with n
 ```bash
 GSETUP="python ~/.hermes/skills/productivity/google-workspace/scripts/setup.py"
 
-$GSETUP --check                                              # AUTHENTICATED? then you're done
-$GSETUP --client-secret /path/to/client_secret.json         # register the client
-$GSETUP --auth-url --services email,calendar --format json  # prints an auth_url — open it in ANY browser
+$GSETUP --check                                     # AUTHENTICATED? then you're done
+$GSETUP --client-secret /path/to/client_secret.json # register the client
+$GSETUP --auth-url                                  # prints an auth_url — open it in ANY browser
 # After approving, the browser lands on a failed http://localhost:1/... page — THAT IS EXPECTED.
 # Copy the ENTIRE redirected URL from the address bar and exchange it:
-$GSETUP --auth-code "PASTE_THE_FULL_REDIRECT_URL_OR_CODE" --format json
-$GSETUP --check                                             # expect: AUTHENTICATED
+$GSETUP --auth-code "PASTE_THE_FULL_REDIRECT_URL_OR_CODE"
+$GSETUP --check                                     # expect: AUTHENTICATED
 ```
 
-Scope it to what you need: `--services email,calendar`, `--services calendar,drive,sheets,docs`, or
-`--services all`. The token lands at `~/.hermes/google_token.json` and **auto-refreshes** from then
-on. To revoke: `$GSETUP --revoke`.
+`setup.py`'s real flags are exactly: `--check`, `--check-live`, `--client-secret`, `--auth-url`,
+`--auth-code`, `--revoke`, `--install-deps`. There is **no `--services` or `--format` flag** — the
+requested scopes are fixed in the skill (in `google_api.py`'s `SCOPES` list: Gmail read/send/modify,
+Calendar, Drive). If you want true least-privilege, edit that `SCOPES` list before authorizing rather
+than passing a flag. The token lands at `~/.hermes/google_token.json` and **auto-refreshes** from
+then on. To revoke: `$GSETUP --revoke`.
 
 ### 10.4 Use it
 

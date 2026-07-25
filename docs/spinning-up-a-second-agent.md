@@ -203,29 +203,35 @@ systemctl --user restart hermes-gateway
 tr '\0' '\n' < /proc/$(pgrep -u "$USER" -f hermes-gateway | head -1)/environ | grep MNEMOSYNE
 ```
 
-### 3c. CLI `store` defaults to session scope
+### 3c. CLI `store` scope, and how to actually prove a round-trip
 
 **Symptom.** Freshly migrated facts vanish cross-session even after 3a/3b are fixed.
 
-**Root cause.** `mnemosyne store` writes `scope=session` by default. Session-scoped rows are invisible
-across sessions unless the env var above is set.
+**Root cause.** Rows stored at `scope=session` are invisible across sessions unless the
+`MNEMOSYNE_CROSS_SESSION=1` env var from [§3b](#3b-cross-session-scoping-bug--recall-returns-0-in-live-sessions)
+is present in the live process. **The env var is the load-bearing fix**, not a per-store flag.
 
-**Fix (belt-and-suspenders).** Store durable facts as `scope=global` so they survive **even if the
-env var is ever lost**:
+> **Do not pass `--scope` to `mnemosyne store`.** `mnemosyne store` is **positional** —
+> `store <content> [source] [importance]`, no flags. `mnemosyne store "fact" --scope global` fails
+> with `Error: importance must be a number: global` (it parses `--scope`→source, `global`→importance)
+> and **stores nothing**. Global scope, if you want the belt-and-suspenders, is a *config* setting
+> (`default_scope: global` in `~/.hermes/mnemosyne/config.yaml`), not a store-time flag — and its
+> visibility via `hermes config get` is inconsistent across installs, so rely on the §3b env var as
+> the real mechanism.
+
+**Verify the whole chain — prove recall, don't just store.** A `store` that "doesn't error" proves
+nothing; make the row come *back*:
 
 ```bash
-mnemosyne store "durable fact" --scope global
-# or promote existing rows in the DB to scope=global
+CANARY="canary-$(date +%s)"
+mnemosyne store "$CANARY: memory round-trip works"   # positional; -> "Stored: <id>"
+mnemosyne recall "$CANARY"                            # MUST return the row (id + content + score)
+hermes mnemosyne stats                               # count should include the canary
 ```
 
-**Verify the whole chain.** Store a canary and recall it from a *fresh* session with the env var
-**unset** — if it comes back, defense-in-depth holds:
-
-```bash
-mnemosyne store "canary-$(date +%s): memory round-trip works" --scope global
-env -u MNEMOSYNE_CROSS_SESSION hermes chat -q "Recall the canary fact you just stored."
-hermes mnemosyne stats     # counts should include the canary
-```
+To prove it survives the cross-session boundary specifically, recall it from a *fresh* agent session
+and confirm the live gateway (which carries the env var) sees it too — if the CLI recalls it but the
+gateway doesn't, that's a §3b env-var gap, not a store problem.
 
 ---
 
