@@ -164,24 +164,41 @@ route.
 
 ## 3. Memory (Mnemosyne) — the three-way break
 
-Long-term memory was wired wrong in **three independent ways** at once. Each is silent on its own.
+Long-term memory was wired wrong in **several independent ways** at once — a missing `[all]` extra
+(no vector backend), a missing bridge plugin, a cross-session scoping env var, and CLI store scope.
+Each is silent on its own.
 
-### 3a. The Hermes↔Mnemosyne bridge plugin isn't installed
+### 3a. The engine's vector extras or the Hermes↔Mnemosyne bridge aren't installed
 
-**Symptom.** `hermes memory status` shows `Provider: mnemosyne` but `Plugin: NOT installed ✗`.
-Logs show `ModuleNotFoundError: No module named 'mnemosyne_hermes'`.
+**Symptom.** Either `hermes memory status` shows `Provider: mnemosyne` but `Plugin: NOT installed ✗`
+(logs: `ModuleNotFoundError: No module named 'mnemosyne_hermes'`), **or** everything looks green,
+`store` works, but semantic `recall` returns weak/irrelevant matches.
 
-**Root cause.** The core `mnemosyne` package can be present in the venv while the **bridge**
-(`mnemosyne-hermes`) is missing or its symlink is stale. Hermes *thinks* it has a memory provider;
-the wire to it is cut.
+**Root cause (two distinct install gaps).**
+1. **Bridge missing.** The core `mnemosyne` package is in the venv while the **bridge**
+   (`mnemosyne-hermes`) is missing or its symlink is stale. Hermes *thinks* it has a memory provider;
+   the wire to it is cut.
+2. **Vector backend missing.** `pip install mnemosyne-memory` (bare) pulls in **only `PyYAML`** — the
+   vector-search + embeddings deps (`sqlite-vec`, `fastembed`) are gated behind the **`[all]`** extra.
+   Install bare and the store still accepts writes, but semantic recall silently degrades to keyword
+   fallback. This is easy to miss because a canary on an *already-provisioned* box (which had `[all]`)
+   passes — you must verify install steps in a **fresh venv**.
 
-**Fix.** Install the bridge into the Hermes venv and relink, then confirm:
+**Fix.** Install the engine **with `[all]`** and the bridge into the Hermes venv, relink, then confirm
+all three: plugin, vector deps, and live coverage.
 
 ```bash
 # inside the agent's Hermes venv
+pip install "mnemosyne-memory[all]"     # engine + sqlite-vec + fastembed (NOT bare — bare omits both)
 pip install mnemosyne-hermes            # provides the mnemosyne_hermes module
 mnemosyne-install                       # relinks the Hermes plugin symlink
+# restart the running process so it sees the relinked plugin (a live process won't):
+systemctl --user restart hermes-gateway 2>/dev/null || true
+
 hermes memory status                    # expect: Plugin: installed ✓ / Status: available ✓
+python -c "import sqlite_vec, fastembed; print('vector deps OK')"          # both must import
+mnemosyne diagnose 2>/dev/null | grep -iE "sqlite-vec|coverage|vec_working"
+#   expect: Working-memory sqlite-vec coverage complete: vec_working rows=N ...
 ```
 
 ### 3b. Cross-session scoping bug — recall returns 0 in live sessions

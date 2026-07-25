@@ -312,11 +312,14 @@ a bridge**, and every failure mode is silent. Install it deliberately and verify
 
 | Piece | Package | Role |
 |---|---|---|
-| Memory engine | `mnemosyne-memory` | The store itself (SQLite + vectors), plus the `mnemosyne` CLI |
+| Memory engine | `mnemosyne-memory[all]` | The store itself (SQLite), **plus the vector-search + embeddings extras** (`sqlite-vec`, `fastembed`) and the `mnemosyne` CLI |
 | Hermes bridge | `mnemosyne-hermes` | The plugin that lets Hermes *call* the engine (`mnemosyne_hermes` module) |
 
-Hermes can show `Provider: mnemosyne` in its config while the **bridge is missing** — so it thinks it
-has memory and every recall silently returns nothing. You must confirm both.
+Two independent silent-failure modes to defend against:
+1. Hermes can show `Provider: mnemosyne` while the **bridge is missing** — it thinks it has memory and every recall returns nothing.
+2. **The engine can install without its vector backend.** A bare `pip install mnemosyne-memory` pulls in *only* `PyYAML` — `sqlite-vec` and `fastembed` are gated behind the **`[all]`** extra. Install bare and the store still "works" and a canary can even *store*, but semantic recall silently falls back to weak/keyword matching. **Always install `mnemosyne-memory[all]`.** (This one bit us: a canary passed on a box that happened to have `[all]` already, while the doc told readers to install bare — verify install steps in a *fresh* venv, not your provisioned box.)
+
+You must confirm both the bridge **and** the vector backend (see §9.4).
 
 ### 9.2 Install into the Hermes venv (not system Python)
 
@@ -328,12 +331,17 @@ wrapper script, **not** a symlink, so don't try to derive the venv from it — a
 source ~/.hermes/hermes-agent/venv/bin/activate
 python -c "import sys; print(sys.executable)"   # sanity: should print a path under ~/.hermes/.../venv
 
-pip install mnemosyne-memory      # the engine + `mnemosyne` CLI
-pip install mnemosyne-hermes      # the Hermes bridge (provides the mnemosyne_hermes module)
-mnemosyne-install                 # relinks the Hermes plugin symlink so Hermes sees the bridge
+pip install "mnemosyne-memory[all]"   # engine + `mnemosyne` CLI + vector backend (sqlite-vec) + embeddings (fastembed)
+pip install mnemosyne-hermes          # the Hermes bridge (provides the mnemosyne_hermes module)
+mnemosyne-install                     # relinks the Hermes plugin symlink so Hermes sees the bridge
 ```
 
-> **Version note (this box, validated):** `mnemosyne-memory 3.14.0` + `mnemosyne-hermes 0.5.0`.
+> **Don't drop the `[all]`.** Bare `pip install mnemosyne-memory` requires only `PyYAML`; the
+> semantic-recall dependencies (`sqlite-vec`, `fastembed`) come **only** with the `[all]` extra.
+> Confirm they landed: `python -c "import sqlite_vec, fastembed; print('vector deps OK')"`.
+
+> **Version note (this box, validated):** `mnemosyne-memory 3.14.0` (+ `sqlite-vec 0.1.9`,
+> `fastembed 0.8.0`) + `mnemosyne-hermes 0.5.0`.
 > `mnemosyne-install` lives inside the venv; the `mnemosyne` CLI is exposed on `~/.local/bin`.
 
 > **Restart after `mnemosyne-install` — or the change is invisible.** The relinked plugin symlink is
@@ -398,6 +406,12 @@ CANARY="canary-$(date +%s)"
 mnemosyne store "$CANARY: memory round-trip works"    # -> "Stored: <id>"
 mnemosyne recall "$CANARY"                            # MUST print the row back (id + content + score)
 hermes mnemosyne stats                               # count should have incremented
+
+# 3. Confirm the VECTOR backend is actually live (not a bare install that degraded to keyword match):
+python -c "import sqlite_vec, fastembed; print('vector deps OK')"   # both must import
+mnemosyne diagnose 2>/dev/null | grep -iE "sqlite-vec|vec_working|coverage"
+#    Expect something like: sqlite-vec coverage complete (vec_working rows=N).
+#    If these are MISSING, you installed bare instead of mnemosyne-memory[all] (§9.2) — reinstall.
 ```
 
 The `mnemosyne recall` returning your canary row is the actual proof — a `store` that merely
