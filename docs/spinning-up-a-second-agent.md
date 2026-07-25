@@ -360,3 +360,66 @@ Before you call a second agent "done," each of these must be **proven**, not ass
 > The through-line: **prove it, don't report it.** Every failure above was invisible to a casual
 > "does it answer?" check and only surfaced under a test that tried to make it fail. Configure with
 > that adversarial mindset and a second agent comes up clean the first time.
+
+---
+
+## 7a. Automated: `verify-agent-health.sh`
+
+The manual checklist above is the spec; [`scripts/verify-agent-health.sh`](../scripts/verify-agent-health.sh)
+is the machine-checkable implementation. It probes the **runtime**, not just the config file —
+because "config says on" is not "actually working" (every one of our four failures passed a config
+read and still didn't work). Point it at any agent's `$HERMES_HOME` and it returns a non-zero exit
+if any axis is broken, so it drops straight into CI or a multi-box rollup.
+
+```bash
+# Check the current user's agent
+./scripts/verify-agent-health.sh
+
+# Check another agent on the box (e.g. from an admin account)
+sudo HERMES_HOME=/home/second-agent/.hermes ./scripts/verify-agent-health.sh
+
+# Machine-readable, for rolling up results across a fleet of Spark boxes
+./scripts/verify-agent-health.sh --json
+```
+
+What it verifies, mapped to the four failure axes from this doc:
+
+| Check | Axis | What "PASS" actually proves (runtime, not config) |
+|---|---|---|
+| `model.default` / `model.provider` | §1 | Primary is a real provider, **not** silently `localhost` + `EMPTY` key |
+| `mem.config` / `mem.binary` / `mem.db` | §3 | `provider: mnemosyne` **and** the `mnemosyne` binary resolves **and** the DB is non-trivial |
+| `backup.local` / `backup.offbox` | §4 | A recent `*.tar.zst.gpg` exists **and** the last off-box push returned `rc=0` |
+| `gw.run` / `gw.perms` | §5 | A gateway process is actually **running** for the account **and** no Discord `403 / 50013` in the logs |
+
+Real output from this repo's reference box (`piment`), run against both live agents:
+
+```
+=== Hermes agent health check :: /home/<agent>/.hermes ===
+--- Axis 1: model/provider ---
+  [PASS] model.default = Claude Opus 4.8
+  [PASS] primary base_url set (https://.../argoapi/v1)
+--- Axis 2: long-term memory (Mnemosyne) ---
+  [PASS] memory provider = mnemosyne in config
+  [PASS] mnemosyne CLI resolves (backend installed)
+  [PASS] mnemosyne.db present (1499136 bytes)
+--- Axis 3: backups (local + off-box) ---
+  [PASS] recent encrypted archive (4 h old): <agent>_20260724_195649.tar.zst.gpg
+  [PASS] last off-box push succeeded (rc=0)
+--- Axis 4: Discord gateway ---
+  [PASS] gateway process is running (pid 688234, user <agent>)
+  [FAIL] Discord 403 Missing Permissions (50013) seen — bot role lacks perms
+=== Summary: 8 pass, 0 warn, 1 fail ===
+```
+
+Note the honest `[FAIL]` on the last line: on our box the bot genuinely lacks `MANAGE_MESSAGES`
+(the pin/unpin permission). That is a **Discord OAuth-invite-scope** fix, not a config-file fix — and
+the script is doing its job by refusing to report green when a real permission gap exists. A checker
+that only ever prints PASS is worthless; this one exits non-zero until the gap is closed or explicitly
+waived.
+
+> **Two bugs we hit writing this script — worth knowing if you adapt it.** (1) `find "$HOME"` breaks
+> under `sudo` because `$HOME` becomes `/root`; derive the account root from `$HERMES_HOME`'s parent
+> instead. (2) The gateway-exit-diag log **only ever records failures** — it never logs a healthy
+> running state — so counting "zero clean exits" falsely flags a perfectly healthy gateway as
+> crash-looping. The authoritative signal for "is the gateway up?" is a live `pgrep`, not a log count.
+
