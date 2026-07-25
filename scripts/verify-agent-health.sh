@@ -180,25 +180,16 @@ if [[ -f "$gw_log" ]]; then
 else
   warn gw.ready "no gateway.log at $gw_log — cannot confirm Discord READY"
 fi
-# Discord permission wall (MANAGE_MESSAGES / 50013). NOTE: grepping errors.log for
-# absence-of-error is NOT proof the permission exists — the log rotates/clears, and a
-# fresh/empty log would then falsely report PASS. So: if a 50013 is present -> FAIL
-# (hard evidence of the gap); if the log is missing/empty -> WARN (cannot confirm),
-# never PASS. Authoritative check is the bot's role bitfield via the Discord API.
-err_log="$HERMES_HOME/logs/errors.log"
-if [[ ! -s "$err_log" ]]; then
-  warn gw.perms "errors.log missing/empty — cannot confirm Discord perms from logs (query the bot role bitfield via API to be sure)"
-elif grep -qiE 'Discord API .*403|code.*50013|Missing Permissions' "$err_log" 2>/dev/null; then
-  bad gw.perms "Discord 403 Missing Permissions (50013) seen — bot role lacks perms (fix via OAuth invite scope, not config)"
-else
-  warn gw.perms "no 50013 in errors.log — but absence-of-error != permission present; confirm via bot role bitfield (Discord API) for a true PASS"
-fi
-
-# gw.perms.probe — OPT-IN positive live probe (Deirdre's ruling: exercise the capability,
-# don't infer it from log absence). Actually pins + unpins a throwaway message via the
-# Discord REST API, so it PROVES MANAGE_MESSAGES right now. This is a WRITE action with
-# side effects (posts/pins/deletes a message), so it is off by default and requires an
-# explicit channel:  ./verify-agent-health.sh --probe-discord --channel=<channel_id>
+# --- Discord perms: LIVE PROBE is the arbiter; log-grep is the read-only fallback. ---
+# Order matters: run the opt-in live probe FIRST so its ground-truth result can override
+# a stale historical 403 in the log below (Deirdre's ruling: when the probe proves the
+# capability is present NOW, a historical-only 403 must not stand as a hard FAIL).
+#
+# gw.perms.probe — OPT-IN positive live probe. Pins + unpins a throwaway message via the
+# Discord REST API, so it PROVES MANAGE_MESSAGES right now. WRITE action with side effects
+# (posts/pins/deletes a message) => off by default:
+#   ./verify-agent-health.sh --probe-discord --channel=<channel_id>
+probe_result="skip"   # skip | pass | fail
 if [[ $PROBE_DISCORD -eq 1 ]]; then
   tok="$(grep -E '^DISCORD_BOT_TOKEN=' "$HERMES_HOME/.env" 2>/dev/null | head -1 | cut -d= -f2-)"
   if [[ -z "$tok" ]]; then
@@ -216,15 +207,18 @@ if [[ $PROBE_DISCORD -eq 1 ]]; then
       | python3 -c 'import sys,json;print(json.load(sys.stdin).get("id",""))' 2>/dev/null)"
     if [[ -z "$msg_id" ]]; then
       bad gw.perms.probe "could not post probe message to channel $PROBE_CHANNEL (token/channel/perms?)"
+      probe_result="fail"
     else
-      # 2) pin it — this is the MANAGE_MESSAGES-gated action that 403'd before the role fix
+      # 2) pin it — the MANAGE_MESSAGES-gated action that 403'd before the role fix
       pin_code="$(curl -s -o /dev/null -w '%{http_code}' -X PUT -H "$auth" \
         "$api/channels/$PROBE_CHANNEL/pins/$msg_id" 2>/dev/null)"
       if [[ "$pin_code" == "204" ]]; then
         ok gw.perms.probe "live pin succeeded (HTTP 204) — MANAGE_MESSAGES confirmed present NOW"
+        probe_result="pass"
         curl -s -o /dev/null -X DELETE -H "$auth" "$api/channels/$PROBE_CHANNEL/pins/$msg_id" 2>/dev/null
       elif [[ "$pin_code" == "403" ]]; then
         bad gw.perms.probe "live pin returned 403 — MANAGE_MESSAGES is genuinely missing right now"
+        probe_result="fail"
       else
         warn gw.perms.probe "live pin returned HTTP $pin_code (inconclusive)"
       fi
@@ -232,6 +226,26 @@ if [[ $PROBE_DISCORD -eq 1 ]]; then
       curl -s -o /dev/null -X DELETE -H "$auth" "$api/channels/$PROBE_CHANNEL/messages/$msg_id" 2>/dev/null
     fi
   fi
+fi
+
+# Discord permission wall (MANAGE_MESSAGES / 50013), read-only log fallback. NOTE: grepping
+# errors.log for absence-of-error is NOT proof the permission exists — the log rotates/clears,
+# and a fresh/empty log would then falsely report PASS. So: if a 50013 is present -> FAIL
+# (hard evidence of the gap); if the log is missing/empty -> WARN (cannot confirm), never PASS.
+# ARBITER OVERRIDE: if the live probe PASSed this run, a historical 50013 is stale evidence and
+# is downgraded to WARN — the probe is ground truth. Authoritative check is the live probe or
+# the bot's role bitfield via the Discord API.
+err_log="$HERMES_HOME/logs/errors.log"
+if [[ ! -s "$err_log" ]]; then
+  warn gw.perms "errors.log missing/empty — cannot confirm Discord perms from logs (query the bot role bitfield via API to be sure)"
+elif grep -qiE 'Discord API .*403|code.*50013|Missing Permissions' "$err_log" 2>/dev/null; then
+  if [[ "$probe_result" == "pass" ]]; then
+    warn gw.perms "historical 50013 in errors.log, but live probe PASSed this run — treating the log 403 as stale (probe is the arbiter)"
+  else
+    bad gw.perms "Discord 403 Missing Permissions (50013) seen — bot role lacks perms (fix via OAuth invite scope, not config). Run --probe-discord to confirm current state."
+  fi
+else
+  warn gw.perms "no 50013 in errors.log — but absence-of-error != permission present; confirm via bot role bitfield (Discord API) or --probe-discord for a true PASS"
 fi
 
 # ---------------------------------------------------------------------------
