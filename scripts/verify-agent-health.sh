@@ -15,6 +15,10 @@
 #   ./verify-agent-health.sh                 # checks the current user's ~/.hermes
 #   HERMES_HOME=/home/deirdre-ai/.hermes ./verify-agent-health.sh
 #   ./verify-agent-health.sh --json          # machine-readable summary (for multi-box rollups)
+#   ./verify-agent-health.sh --probe-discord --channel=<id>
+#          # OPT-IN: live pin/unpin test that PROVES MANAGE_MESSAGES now (write action,
+#          # has side effects — posts+pins+deletes a throwaway message). Default run is
+#          # read-only and idempotent; the probe is only for when you want hard proof.
 
 set -uo pipefail
 
@@ -24,7 +28,15 @@ CONFIG="$HERMES_HOME/config.yaml"
 ACCT_HOME="$(dirname "$HERMES_HOME")"
 acct_user="$(basename "$ACCT_HOME")"
 JSON=0
-[[ "${1:-}" == "--json" ]] && JSON=1
+PROBE_DISCORD=0
+PROBE_CHANNEL="${PROBE_CHANNEL:-}"
+for arg in "$@"; do
+  case "$arg" in
+    --json)          JSON=1 ;;
+    --probe-discord) PROBE_DISCORD=1 ;;
+    --channel=*)     PROBE_CHANNEL="${arg#--channel=}" ;;
+  esac
+done
 
 PASS=0; FAIL=0; WARN=0
 declare -A RESULT
@@ -138,7 +150,6 @@ fi
 # ---------------------------------------------------------------------------
 [[ $JSON -eq 0 ]] && echo "--- Axis 4: Discord gateway ---"
 # Authoritative signal: is a gateway process actually alive for this account?
-acct_user="$(basename "$ACCT_HOME")"
 gw_live="$(pgrep -u "$acct_user" -f 'gateway run' 2>/dev/null | head -1)"
 gw_diag="$(ls -1t "$HERMES_HOME"/logs/gateway-exit-diag.log 2>/dev/null | head -1)"
 if [[ -n "$gw_live" ]]; then
@@ -181,6 +192,46 @@ elif grep -qiE 'Discord API .*403|code.*50013|Missing Permissions' "$err_log" 2>
   bad gw.perms "Discord 403 Missing Permissions (50013) seen — bot role lacks perms (fix via OAuth invite scope, not config)"
 else
   warn gw.perms "no 50013 in errors.log — but absence-of-error != permission present; confirm via bot role bitfield (Discord API) for a true PASS"
+fi
+
+# gw.perms.probe — OPT-IN positive live probe (Deirdre's ruling: exercise the capability,
+# don't infer it from log absence). Actually pins + unpins a throwaway message via the
+# Discord REST API, so it PROVES MANAGE_MESSAGES right now. This is a WRITE action with
+# side effects (posts/pins/deletes a message), so it is off by default and requires an
+# explicit channel:  ./verify-agent-health.sh --probe-discord --channel=<channel_id>
+if [[ $PROBE_DISCORD -eq 1 ]]; then
+  tok="$(grep -E '^DISCORD_BOT_TOKEN=' "$HERMES_HOME/.env" 2>/dev/null | head -1 | cut -d= -f2-)"
+  if [[ -z "$tok" ]]; then
+    warn gw.perms.probe "--probe-discord set but no DISCORD_BOT_TOKEN in $HERMES_HOME/.env"
+  elif [[ -z "$PROBE_CHANNEL" ]]; then
+    warn gw.perms.probe "--probe-discord set but no --channel=<id> given (need a channel to test a pin)"
+  elif ! command -v curl >/dev/null 2>&1 || ! command -v python3 >/dev/null 2>&1; then
+    warn gw.perms.probe "--probe-discord needs curl + python3 to call the Discord API"
+  else
+    api="https://discord.com/api/v10"; auth="Authorization: Bot $tok"
+    # 1) post a throwaway message
+    msg_id="$(curl -s -H "$auth" -H 'Content-Type: application/json' \
+      -d '{"content":"health-check pin probe (auto-deleted)"}' \
+      "$api/channels/$PROBE_CHANNEL/messages" 2>/dev/null \
+      | python3 -c 'import sys,json;print(json.load(sys.stdin).get("id",""))' 2>/dev/null)"
+    if [[ -z "$msg_id" ]]; then
+      bad gw.perms.probe "could not post probe message to channel $PROBE_CHANNEL (token/channel/perms?)"
+    else
+      # 2) pin it — this is the MANAGE_MESSAGES-gated action that 403'd before the role fix
+      pin_code="$(curl -s -o /dev/null -w '%{http_code}' -X PUT -H "$auth" \
+        "$api/channels/$PROBE_CHANNEL/pins/$msg_id" 2>/dev/null)"
+      if [[ "$pin_code" == "204" ]]; then
+        ok gw.perms.probe "live pin succeeded (HTTP 204) — MANAGE_MESSAGES confirmed present NOW"
+        curl -s -o /dev/null -X DELETE -H "$auth" "$api/channels/$PROBE_CHANNEL/pins/$msg_id" 2>/dev/null
+      elif [[ "$pin_code" == "403" ]]; then
+        bad gw.perms.probe "live pin returned 403 — MANAGE_MESSAGES is genuinely missing right now"
+      else
+        warn gw.perms.probe "live pin returned HTTP $pin_code (inconclusive)"
+      fi
+      # 3) clean up the throwaway message regardless
+      curl -s -o /dev/null -X DELETE -H "$auth" "$api/channels/$PROBE_CHANNEL/messages/$msg_id" 2>/dev/null
+    fi
+  fi
 fi
 
 # ---------------------------------------------------------------------------
