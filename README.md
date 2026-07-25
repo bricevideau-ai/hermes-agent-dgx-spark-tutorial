@@ -19,6 +19,7 @@ A hands-on, reproducible guide to standing up [Hermes Agent](https://github.com/
 9. [Skills, Memory & Cron](#9-skills-memory--cron)
 10. [Reproducibility Checklist](#10-reproducibility-checklist)
 11. [Troubleshooting on ARM64](#11-troubleshooting-on-arm64)
+12. [Running a Second Agent on the Same Box](#12-running-a-second-agent-on-the-same-box)
 
 ---
 
@@ -298,6 +299,20 @@ Commit these (minus secrets) so another box can be brought up identically.
 | pip package builds from source (ARM64) | Ensure `build-essential` (+ `cmake`/`ninja`) are installed |
 | vLLM OOM on GB10 | Lower `--max-model-len` and `--gpu-memory-utilization`; pick a smaller/quantized model |
 | Auxiliary tasks (vision/compression) fail silently | Set `OPENROUTER_API_KEY` or `GOOGLE_API_KEY`, or configure `auxiliary.*.provider` |
+
+---
+
+## 12. Running a Second Agent on the Same Box
+
+Standing up a **second, fully independent agent** (its own Linux user, `$HERMES_HOME`, memory,
+backups, and Discord bot) has its own set of sharp edges — model wiring that silently downgrades to
+the local model, memory that recalls nothing cross-session, backups that never actually push
+off-box, and a Discord bot with no role. We hit all of them provisioning our second agent, and wrote
+them up with symptom → root cause → fix → **verification** for each:
+
+**→ [Spinning Up a Second Hermes Agent (and Not Botching It)](docs/spinning-up-a-second-agent.md)**
+
+Start with its [Five-Point Pre-Flight Checklist](docs/spinning-up-a-second-agent.md#7-the-five-point-pre-flight-checklist).
 
 ---
 
