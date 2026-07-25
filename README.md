@@ -387,6 +387,20 @@ This is the **primary, sanctioned mechanism** and the one to set. Verified again
 bridge (`mnemosyne_hermes`) reads this exact key via `read_hermes_config_key()` and applies it to every
 `remember()` that doesn't pass an explicit scope.
 
+> **⚠️ How to verify this WITHOUT fooling yourself.** The provider learns where Hermes' config lives
+> *only* from a `hermes_home` kwarg passed at init (`self._hermes_home = kwargs.get("hermes_home", "")`
+> — there is **no** fallback to `HERMES_HOME` or `get_hermes_home()`). So a hand-rolled
+> `MnemosyneMemoryProvider()` in a REPL gets `_hermes_home=""`, `read_hermes_config_key("", …)` returns
+> `None`, and the default scope silently stays `session` — making a correctly-configured system *look
+> broken*. We reproduced exactly this false negative. **Validate through the live agent, not a
+> hand-built provider:** have the agent store a fact, then read the row's scope back:
+> ```bash
+> # after the agent (via gateway) stores something with mnemosyne_remember:
+> sqlite3 ~/.hermes/mnemosyne/data/mnemosyne.db \
+>   "SELECT scope, substr(content,1,40) FROM working_memory ORDER BY rowid DESC LIMIT 3;"
+> # expect the newest agent-written rows to show scope=global
+> ```
+
 > ⚠️ **Do *not* use `mnemosyne config set default_scope global` for this.** That writes Mnemosyne's
 > *own* `~/.hermes/mnemosyne/config.yaml`, which the agent bridge never reads — and the `mnemosyne`
 > **CLI** `store` doesn't read it either (see path 2). It looks like it works (`mnemosyne config get`

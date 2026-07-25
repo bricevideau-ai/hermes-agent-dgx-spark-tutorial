@@ -241,6 +241,14 @@ tr '\0' '\n' < /proc/$(pgrep -u "$USER" -f hermes-gateway | head -1)/environ | g
 >   `config.get("cross_session")==True` while `_cross_session_enabled()==False`. The override works only
 >   via the env var.
 
+> **⚠️ Verify through the live agent, or you'll get a false negative.** The provider learns Hermes'
+> config location *only* from a `hermes_home` kwarg at init (`self._hermes_home = kwargs.get("hermes_home","")`
+> — no fallback to `HERMES_HOME`/`get_hermes_home()`). A hand-built `MnemosyneMemoryProvider()` in a REPL
+> therefore reads no Hermes config and reports `scope=session` even when `memory.mnemosyne.default_scope`
+> is correctly `global` — a harness gap, not a bug. Prove the agent path by storing via the agent and
+> reading the row back: `sqlite3 ~/.hermes/mnemosyne/data/mnemosyne.db "SELECT scope,substr(content,1,40)
+> FROM working_memory ORDER BY rowid DESC LIMIT 3;"` → newest agent-written rows should be `global`.
+
 ### 3c. CLI `store` scope, and how to actually prove a round-trip
 
 **Symptom.** Freshly migrated facts vanish cross-session even after 3a/3b are fixed.
