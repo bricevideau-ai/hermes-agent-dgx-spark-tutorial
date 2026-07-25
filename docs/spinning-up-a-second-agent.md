@@ -18,7 +18,7 @@
 2. [Fallback Chain — redundancy in hardware is not redundancy in config](#2-fallback-chain--redundancy-in-hardware-is-not-redundancy-in-config)
 3. [Memory (Mnemosyne) — the three-way break](#3-memory-mnemosyne--the-three-way-break)
 4. [Backups — an untested backup is not a backup](#4-backups--an-untested-backup-is-not-a-backup)
-5. [Discord — roles, permissions, and the READY that never comes](#5-discord--roles-permissions-and-the-ready-that-never-comes)
+5. [Discord — roles and permissions](#5-discord--roles-and-permissions)
 6. [Account & Identity Isolation](#6-account--identity-isolation)
 7. [The Five-Point Pre-Flight Checklist](#7-the-five-point-pre-flight-checklist)
 
@@ -287,31 +287,40 @@ than none.
 
 ---
 
-## 5. Discord — roles, permissions, and the READY that never comes
+## 5. Discord — roles and permissions
 
-**Symptom 1.** The second bot doesn't render as a server member and can't pin
+**Symptom.** The second bot doesn't render as a server member and can't pin
 (`403 Missing Permissions` / `MANAGE_MESSAGES`).
 
-**Root cause.** The bot had **no role** (`roles: []`). The first bot had a `managed: true` role
-auto-created when it was invited with the right OAuth scope; the second was invited without it.
+**Root cause.** The bot was invited **without a role**, so it landed in the server on `@everyone`
+only (`roles: []`). The first bot had a `managed: true` role auto-created when it was invited with the
+right OAuth scope; the second invite lacked it. No role → no `MANAGE_MESSAGES` → pin returns `403`,
+and (combined with intents) it doesn't render in the member sidebar.
 
-**Fix.** Re-invite the bot via an OAuth2 URL that grants the needed scope/permissions (or an admin
-role). Then **verify with the exact call that failed** — pin a throwaway message and unpin it:
+**Fix.** Re-invite the bot via an OAuth2 URL that grants a managed role with the needed permissions
+(admin is simplest; scope it down if you prefer). This is a human step in the Discord UI — the bot
+cannot grant itself a role.
+
+**Verify — two independent checks, both against ground truth:**
 
 ```bash
-# via the discord admin tooling: pin_message → expect success (not 403), then unpin to clean up.
+# 1. The bot's gateway actually reaches READY (discord.py's on_ready).
+#    The "Connected as <bot>#<discriminator>" line ONLY prints on on_ready — that IS READY.
+grep -E "Connected as|discord connected" ~/.hermes/logs/gateway.log | tail
+# Expect a line like:  [Discord] Connected as Deirdre#0968   then   ✓ discord connected
+# (One per restart. If this line is absent, the session is NOT logged in — a real red flag.)
+
+# 2. The role landed and the exact privileged action that 403'd now succeeds.
+#    Via the discord admin tooling: member_info → expect a non-empty "roles" array;
+#    then pin_message a throwaway message → expect success (not 403) → unpin to clean up.
 ```
 
-**Symptom 2 (still open — flag it, don't hand-wave it).** Even after the role/permission fix, the
-second gateway's Discord session **never reaches READY**: the gateway boots, loads tools, and runs,
-but `~/.hermes/logs/gateway.log` contains **no** `logged in / READY / connected / guild` line the way
-the first agent's does. Member-list invisibility traces to this, not to the Presence intent (ticking
-the same intents as the first bot did **not** change it).
-
-> **Lesson for the tutorial:** "the bot answers messages" and "the bot's gateway fully logged in"
-> are different states. Grep the gateway log for a READY/guild line as an explicit health check when
-> provisioning a new bot. This one is **unresolved** as of writing — documented here honestly so the
-> next person doesn't assume it's fixed.
+> **Lesson (the durable part):** "the bot answers messages" and "the bot's gateway is fully logged
+> in (READY) with the right role" are **different states**. Don't infer one from the other. Make the
+> READY line and a non-empty `roles` array explicit health checks when provisioning a new bot — and
+> read the *right* log line: `Connected as …` is READY; a generic `response ready` line is unrelated
+> request-handling noise and does **not** prove login. (We initially misdiagnosed this by grepping
+> too loosely and matching `response ready`; the fix was to grep for `Connected as` specifically.)
 
 ---
 
@@ -354,8 +363,9 @@ Before you call a second agent "done," each of these must be **proven**, not ass
       live process env; canary fact recalled from a fresh session; durable facts `scope=global`.
 - [ ] **Backup.** Encrypted archive pushed off-box on a cron; **restored from the cloud copy** and
       `PRAGMA integrity_check` = `ok`; passphrase pinned off-box; negative test fails loud.
-- [ ] **Discord.** Bot has a managed role; the exact privileged action that failed now succeeds
-      (pin/unpin); gateway log shows a READY/guild line — or the gap is explicitly documented.
+- [ ] **Discord.** Bot has a managed role (`member_info` shows a non-empty `roles`); the exact
+      privileged action that failed now succeeds (pin/unpin); gateway log shows a `Connected as …`
+      READY line (not a generic `response ready` line).
 
 > The through-line: **prove it, don't report it.** Every failure above was invisible to a casual
 > "does it answer?" check and only surfaced under a test that tried to make it fail. Configure with
