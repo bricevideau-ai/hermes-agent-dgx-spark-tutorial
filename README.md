@@ -16,10 +16,12 @@ A hands-on, reproducible guide to standing up [Hermes Agent](https://github.com/
 6. [Wiring Up a Local LLM on the Spark](#6-wiring-up-a-local-llm-on-the-spark)
 7. [Adding the Discord Gateway](#7-adding-the-discord-gateway)
 8. [Running Hermes as a Persistent Service](#8-running-hermes-as-a-persistent-service)
-9. [Skills, Memory & Cron](#9-skills-memory--cron)
-10. [Reproducibility Checklist](#10-reproducibility-checklist)
-11. [Troubleshooting on ARM64](#11-troubleshooting-on-arm64)
-12. [Running a Second Agent on the Same Box](#12-running-a-second-agent-on-the-same-box)
+9. [Long-Term Memory (Mnemosyne)](#9-long-term-memory-mnemosyne)
+10. [Google Integration (Gmail, Calendar, Drive, Docs)](#10-google-integration-gmail-calendar-drive-docs)
+11. [Skills & Cron](#11-skills--cron)
+12. [Reproducibility Checklist](#12-reproducibility-checklist)
+13. [Troubleshooting on ARM64](#13-troubleshooting-on-arm64)
+14. [Running a Second Agent on the Same Box](#14-running-a-second-agent-on-the-same-box)
 
 ---
 
@@ -196,25 +198,77 @@ Now you can flip between local and hosted models by editing `model.provider` / `
 
 ## 7. Adding the Discord Gateway
 
-Hermes' gateway runs the *same agent* on messaging platforms with full tool access.
+Hermes' gateway runs the *same agent* — same tools, memory, and skills — on messaging platforms.
+Discord is the most common target, and it's also **the step most likely to go subtly wrong**: the bot
+can happily answer messages while still being misconfigured in ways that only bite later (can't pin,
+doesn't show as a member, ignores everyone / ignores no one). Do it in this exact order.
+
+### 7.1 Create the application and bot
+
+1. Go to the [Discord Developer Portal](https://discord.com/developers/applications) → **New
+   Application**. Name it after the agent (e.g. `Corwin`).
+2. Left sidebar → **Bot**. The bot user is created automatically.
+3. On the **Bot** page, click **Reset Token**, then **Copy** — this is the value that goes in
+   `~/.hermes/.env` (below). You only see it once; if you lose it, reset again.
+
+### 7.2 Enable the privileged intent (the #1 silent failure)
+
+Still on the **Bot** page, under **Privileged Gateway Intents**, turn on **Message Content Intent**
+and click **Save Changes**.
+
+> Without this the bot connects, shows green/online, and **silently ignores every message** — no error
+> anywhere. If your bot is online but deaf, this is almost always why. (`Presence` and `Server
+> Members` intents are optional and off by default; leave them off unless a skill needs them.)
+
+### 7.3 Invite the bot **with a role** (the trap that cost us a day on the second agent)
+
+Generate the invite under **OAuth2 → URL Generator**:
+
+- **Scopes:** check **both** `bot` **and** `applications.commands`.
+- **Bot Permissions:** at minimum `View Channels`, `Send Messages`, `Read Message History`,
+  `Embed Links`, `Attach Files`, `Add Reactions`, and — critically — **`Manage Messages`** if you
+  want the bot to pin/unpin. If in doubt, `Administrator` is simplest and you can scope down later.
+
+Copy the generated URL at the bottom, open it, pick your server, and **Authorize**.
+
+> **Why the permission checkboxes matter — a real failure.** When you invite a bot *with* a
+> permissions bitmask, Discord auto-creates a **managed role** for it carrying those permissions. We
+> invited our second agent with a bare `bot`-scope link and **no permissions selected**, so it landed
+> on `@everyone` only with `roles: []`. Result: `403 Missing Permissions (50013)` on every pin, and it
+> didn't render in the member sidebar. **A bot cannot grant itself a role** — the only fix is to
+> re-invite with the correct OAuth2 URL. Get the permissions right in the invite the first time.
+
+### 7.4 Wire the token into Hermes and run
 
 ```bash
-hermes gateway setup       # interactive platform config
+# In ~/.hermes/.env :
+#   DISCORD_BOT_TOKEN=<the token from step 7.1>
+#   DISCORD_ALLOWED_USERS=<your_numeric_user_id>   # recommended: only you can command it
+
+hermes gateway setup       # interactive platform config; select Discord, confirm the token
+hermes gateway run         # FOREGROUND first — watch the logs before daemonizing
 ```
 
-For Discord:
+To get your numeric user ID: Discord → **User Settings → Advanced → Developer Mode ON**, then
+right-click your name → **Copy User ID**.
 
-1. Create a bot at the [Discord Developer Portal](https://discord.com/developers/applications).
-2. **Enable Message Content Intent** under Bot → Privileged Gateway Intents (the bot is silent without it).
-3. Put the token in `~/.hermes/.env` (`DISCORD_BOT_TOKEN=...`).
-4. (Recommended) Restrict who can command it: `DISCORD_ALLOWED_USERS=<your_user_id>`.
-5. Invite the bot to your server with the OAuth2 URL from the portal.
+### 7.5 Verify it's actually READY (not just "online")
 
-Run it in the foreground first to watch the logs:
+"Shows as online" and "logged in and usable" are different states. Prove READY from the logs:
 
 ```bash
-hermes gateway run
+grep -E "Connected as" ~/.hermes/logs/gateway.log | tail
+# Expect a line like:  [Discord] Connected as Corwin#8416   then   ✓ discord connected
 ```
+
+That `Connected as …` line **only** prints on discord.py's `on_ready` event — that is the
+authoritative "the session logged in" signal. A generic `response ready` line is unrelated
+request-handling noise and does **not** prove login. Then send the bot a message from an allowed
+account and confirm it replies. If you enabled `Manage Messages`, pin a throwaway message and unpin
+it to confirm the permission actually landed (a non-empty `roles` array + a successful pin, not a 403).
+
+> Provisioning a **second** bot on the same server hits extra role/permission edges — see the
+> companion doc's [§5 Discord — roles and permissions](docs/spinning-up-a-second-agent.md#5-discord--roles-and-permissions).
 
 ---
 
@@ -248,9 +302,149 @@ grep -iE "failed to send|error" ~/.hermes/logs/gateway.log | tail -20
 
 ---
 
-## 9. Skills, Memory & Cron
+## 9. Long-Term Memory (Mnemosyne)
 
-What makes Hermes more than a chat wrapper:
+This is the single feature that turns Hermes from a chat window into an agent that *remembers you*
+across sessions — and it's the one most people wire up wrong, because it involves **two packages plus
+a bridge**, and every failure mode is silent. Install it deliberately and verify each layer.
+
+### 9.1 What the pieces are
+
+| Piece | Package | Role |
+|---|---|---|
+| Memory engine | `mnemosyne-memory` | The store itself (SQLite + vectors), plus the `mnemosyne` CLI |
+| Hermes bridge | `mnemosyne-hermes` | The plugin that lets Hermes *call* the engine (`mnemosyne_hermes` module) |
+
+Hermes can show `Provider: mnemosyne` in its config while the **bridge is missing** — so it thinks it
+has memory and every recall silently returns nothing. You must confirm both.
+
+### 9.2 Install into the Hermes venv (not system Python)
+
+Everything must land in the **agent's own** Hermes virtualenv. On this box that is
+`~/.hermes/hermes-agent/venv` — confirm yours before installing:
+
+```bash
+# Find and activate the Hermes venv (the path Hermes' own launcher uses):
+HERMES_VENV="$(dirname "$(dirname "$(readlink -f "$(command -v hermes)")")")"
+# On our box this resolves to ~/.hermes/hermes-agent/venv
+source "$HERMES_VENV/bin/activate"
+python -c "import sys; print(sys.executable)"   # sanity: should be under ~/.hermes/.../venv
+
+pip install mnemosyne-memory      # the engine + `mnemosyne` CLI
+pip install mnemosyne-hermes      # the Hermes bridge (provides the mnemosyne_hermes module)
+mnemosyne-install                 # relinks the Hermes plugin symlink so Hermes sees the bridge
+```
+
+> **Version note (this box, validated):** `mnemosyne-memory 3.14.0` + `mnemosyne-hermes 0.5.0`.
+> `mnemosyne-install` lives inside the venv; the `mnemosyne` CLI is exposed on `~/.local/bin`.
+
+### 9.3 Point Hermes at it and set global scope
+
+```bash
+hermes config set memory.provider mnemosyne
+# Store durable facts GLOBALLY so they survive across sessions even if an env flag is ever lost:
+hermes config set memory.mnemosyne.default_scope global
+```
+
+`default_scope: global` is the belt-and-suspenders setting. Session-scoped rows are invisible to
+*other* sessions unless `MNEMOSYNE_CROSS_SESSION=1` is present in the process environment **at import
+time** — a genuinely surprising footgun. Setting the default scope to `global` sidesteps it for the
+durable facts you actually care about. (If you run the gateway as a service, also add
+`Environment=MNEMOSYNE_CROSS_SESSION=1` to the systemd unit — see the companion doc's
+[§3b](docs/spinning-up-a-second-agent.md#3b-cross-session-scoping-bug--recall-returns-0-in-live-sessions).)
+
+### 9.4 Verify the whole chain — don't trust the status line alone
+
+```bash
+# 1. Both the provider AND the plugin must report healthy:
+hermes memory status
+#    Expect:  Provider: mnemosyne   AND   Plugin: installed ✓ / Status: available ✓
+#    A "Plugin: NOT installed ✗" here means 9.2 didn't take — re-run pip install + mnemosyne-install.
+
+# 2. Round-trip a canary through the CLI and recall it from a FRESH agent session:
+mnemosyne store "canary-$(date +%s): memory round-trip works" --scope global
+hermes chat -q "Recall the canary fact you just stored."   # it should quote the canary back
+mnemosyne stats                                            # counts should include the canary
+```
+
+If `hermes memory status` is green but recall returns nothing, the usual culprits are: the bridge
+went into the wrong venv (9.2), the scope is `session` not `global` (9.3), or — for the gateway
+specifically — `MNEMOSYNE_CROSS_SESSION` isn't in the *live process* env. The companion doc walks
+each of these three independent breaks with a proof step:
+[§3 Memory (Mnemosyne) — the three-way break](docs/spinning-up-a-second-agent.md#3-memory-mnemosyne--the-three-way-break).
+
+---
+
+## 10. Google Integration (Gmail, Calendar, Drive, Docs)
+
+Hermes talks to Google Workspace through the bundled **`google-workspace`** skill, which manages
+OAuth for you. There are **two paths** — pick by what you actually need, because they have very
+different setup costs.
+
+### 10.1 Decide: App Password (email only) vs. OAuth (full Workspace)
+
+- **Just email?** Skip Google Cloud entirely. Use the **`himalaya`** skill with a Gmail **App
+  Password** (Google Account → **Security → 2-Step Verification → App passwords**). Two minutes, no
+  cloud project. Load the skill and follow its setup.
+- **Calendar / Drive / Sheets / Docs (or email + those)?** Use the `google-workspace` skill with
+  OAuth, below.
+
+> **On this box:** email is handled via `himalaya` + an App Password; the OAuth `google-workspace`
+> path is what you'd add for Drive/Calendar. Don't reuse one agent's Google token for another agent —
+> each agent gets its own credentials (see the companion doc's
+> [§6 Account & Identity Isolation](docs/spinning-up-a-second-agent.md#6-account--identity-isolation)).
+
+### 10.2 One-time: create an OAuth client in Google Cloud (~5 min)
+
+1. Create/select a project: <https://console.cloud.google.com/projectselector2/home/dashboard>
+2. Enable the APIs you need from the **API Library**
+   (<https://console.cloud.google.com/apis/library>): Gmail, Calendar, Drive, Sheets, Docs, People.
+3. **Credentials → Create Credentials → OAuth 2.0 Client ID → Application type: _Desktop app_ →
+   Create.** (Desktop-app type is what the skill's PKCE flow expects.)
+4. If the OAuth app is still in **Testing**, add your Google account as a **test user** at
+   <https://console.cloud.google.com/auth/audience> — otherwise you'll get `Error 403: access_denied`.
+5. **Download the client-secret JSON** and note its path.
+
+### 10.3 Authorize (works fully headless — no browser on the box)
+
+The skill drives OAuth step-by-step so it works over SSH/Discord/Telegram with no local browser:
+
+```bash
+GSETUP="python ~/.hermes/skills/productivity/google-workspace/scripts/setup.py"
+
+$GSETUP --check                                              # AUTHENTICATED? then you're done
+$GSETUP --client-secret /path/to/client_secret.json         # register the client
+$GSETUP --auth-url --services email,calendar --format json  # prints an auth_url — open it in ANY browser
+# After approving, the browser lands on a failed http://localhost:1/... page — THAT IS EXPECTED.
+# Copy the ENTIRE redirected URL from the address bar and exchange it:
+$GSETUP --auth-code "PASTE_THE_FULL_REDIRECT_URL_OR_CODE" --format json
+$GSETUP --check                                             # expect: AUTHENTICATED
+```
+
+Scope it to what you need: `--services email,calendar`, `--services calendar,drive,sheets,docs`, or
+`--services all`. The token lands at `~/.hermes/google_token.json` and **auto-refreshes** from then
+on. To revoke: `$GSETUP --revoke`.
+
+### 10.4 Use it
+
+```bash
+GAPI="python ~/.hermes/skills/productivity/google-workspace/scripts/google_api.py"
+$GAPI gmail search "is:unread" --max 10
+$GAPI calendar list
+$GAPI drive upload /path/to/report.pdf
+```
+
+> **Off-box backups to Drive** use a *different* mechanism — `rclone` with least-privilege
+> `drive.file` scope and its own headless-authorize flow — covered in the companion doc's
+> [§4 Backups](docs/spinning-up-a-second-agent.md#4-backups--an-untested-backup-is-not-a-backup).
+> Don't conflate the `google-workspace` OAuth token (LLM/skill actions) with the rclone remote (bulk
+> file sync); they are separate credentials with separate scopes on purpose.
+
+---
+
+## 11. Skills & Cron
+
+Beyond memory, two more things make Hermes durable:
 
 - **Skills** — reusable procedures the agent loads on demand and can author itself.
   ```bash
@@ -258,21 +452,19 @@ What makes Hermes more than a chat wrapper:
   hermes skills browse
   hermes skills install <id>
   ```
-- **Memory** — persistent facts/preferences across sessions.
-  ```bash
-  hermes memory status
-  ```
 - **Cron** — durable scheduled agent runs.
   ```bash
   hermes cron create "0 9 * * *"    # e.g. a daily briefing
   hermes cron list
   ```
 
-For a research program (e.g. benchmarking many local models over time), pair cron jobs with a skill that runs a standard benchmark suite and appends results to a persistent registry — so runs are reproducible and comparable across DGX Spark boxes.
+For a research program (e.g. benchmarking many local models over time), pair cron jobs with a skill
+that runs a standard benchmark suite and appends results to a persistent registry — so runs are
+reproducible and comparable across DGX Spark boxes.
 
 ---
 
-## 10. Reproducibility Checklist
+## 12. Reproducibility Checklist
 
 For team deployments across multiple Spark boxes, capture:
 
@@ -287,13 +479,18 @@ Commit these (minus secrets) so another box can be brought up identically.
 
 ---
 
-## 11. Troubleshooting on ARM64
+## 13. Troubleshooting on ARM64
 
 | Symptom | Fix |
 |---|---|
 | `hermes` not found after install | `source ~/.bashrc`; confirm the installer added it to `PATH` |
 | Model/provider errors | `hermes doctor`; check the API key in `~/.hermes/.env`; `hermes auth` for OAuth providers |
-| Discord bot silent | Enable **Message Content Intent** in the Developer Portal |
+| Discord bot **online but ignores messages** | Enable **Message Content Intent** (Developer Portal → Bot → Privileged Gateway Intents) — see §7.2 |
+| Discord bot **can't pin / `403 Missing Permissions (50013)`** | Bot was invited without a role; re-invite via an OAuth2 URL granting `Manage Messages` — see §7.3 |
+| Discord bot not in member sidebar | Same root cause as above — no managed role from the invite |
+| `hermes memory status` shows `Plugin: NOT installed ✗` | Install `mnemosyne-hermes` into the **Hermes venv** and run `mnemosyne-install` — see §9.2 |
+| Memory status green but recall returns nothing | Scope is `session` not `global` (§9.3), or bridge went into the wrong venv, or `MNEMOSYNE_CROSS_SESSION` missing from the live gateway env |
+| Google OAuth `Error 403: access_denied` | Add your account as a **test user** at the OAuth audience page — see §10.2 |
 | Gateway dies on SSH logout | `sudo loginctl enable-linger $USER` |
 | Gateway crash loop | `systemctl --user reset-failed hermes-gateway` |
 | pip package builds from source (ARM64) | Ensure `build-essential` (+ `cmake`/`ninja`) are installed |
@@ -302,7 +499,7 @@ Commit these (minus secrets) so another box can be brought up identically.
 
 ---
 
-## 12. Running a Second Agent on the Same Box
+## 14. Running a Second Agent on the Same Box
 
 Standing up a **second, fully independent agent** (its own Linux user, `$HERMES_HOME`, memory,
 backups, and Discord bot) has its own set of sharp edges — model wiring that silently downgrades to
