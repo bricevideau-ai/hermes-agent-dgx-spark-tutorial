@@ -359,34 +359,58 @@ hermes config set memory.provider mnemosyne
 ```
 
 The subtle part is **cross-session recall**: by default a fact stored in one session is invisible to
-*other* sessions. There are **two mechanisms**, and they are not interchangeable — we proved the exact
-behavior with a fresh DB and real `BeamMemory` store→recall across two session IDs:
+*other* sessions. Getting this right means understanding that **scope is set on write, and there are
+three separate code paths that each read the "default scope" setting from a *different* place** — a
+map we only fully untangled by reading the source and reproducing each path.
+
+First, the recall behavior by stored scope (proven with a fresh DB and real `BeamMemory` store→recall
+across two session IDs):
 
 | Stored scope | no env var | `MNEMOSYNE_CROSS_SESSION=1` |
 |---|---|---|
 | `scope=global`  | ✅ recalled cross-session | ✅ recalled |
 | `scope=session` | ❌ not recalled            | ✅ recalled |
 
-**1. `default_scope: global` — the primary, sanctioned mechanism.** The recall filter is
-`(session_id = ? OR scope = 'global')`, so a `global`-scoped memory is visible everywhere **with no env
-var at all**. Store durable facts at global scope. This lives in Mnemosyne's own
-`~/.hermes/mnemosyne/config.yaml`:
+So the goal is: **make your durable memories store at `scope=global`.** How you set that depends on
+which path writes them.
+
+**1. The agent (bridge) path — the one that matters. Set it in Hermes config.**
+When *the agent* stores a memory (`mnemosyne_remember`), the bridge resolves the default scope from
+**`memory.mnemosyne.default_scope` in Hermes' own `~/.hermes/config.yaml`**:
 
 ```bash
-# Mnemosyne's own config (not `hermes config`); edit the file or:
-mnemosyne config set default_scope global   # persists in ~/.hermes/mnemosyne/config.yaml
+hermes config set memory.mnemosyne.default_scope global
+hermes config get memory.mnemosyne.default_scope        # -> global
 ```
 
-> Mnemosyne's own `profiles.py` (Rule 3) treats `default_scope: session` while cross-session is
-> requested as a **configuration error** — "cross-session visibility requires global scope." Global
-> scope is the intended resting state for an agent that should remember you.
+This is the **primary, sanctioned mechanism** and the one to set. Verified against the source: the
+bridge (`mnemosyne_hermes`) reads this exact key via `read_hermes_config_key()` and applies it to every
+`remember()` that doesn't pass an explicit scope.
 
-**2. `MNEMOSYNE_CROSS_SESSION=1` — the broader override (belt-and-suspenders).** This drops session
-filtering entirely (the filter becomes `(1=1)`), so it *additionally* exposes any legacy
-`session`-scoped rows you stored before switching to global scope. Set it only if you have old
-session-scoped facts to surface, or want the absolute guarantee. Because it's the one lever the recall
-path actually reads (see the warning below), set it via a **systemd drop-in** so it survives
+> ⚠️ **Do *not* use `mnemosyne config set default_scope global` for this.** That writes Mnemosyne's
+> *own* `~/.hermes/mnemosyne/config.yaml`, which the agent bridge never reads — and the `mnemosyne`
+> **CLI** `store` doesn't read it either (see path 2). It looks like it works (`mnemosyne config get`
+> reflects it) but changes nothing about what scope gets stored. Use the `hermes config` key above.
+
+**2. The CLI path (`mnemosyne store`) — env var only (known bug).**
+If you seed memories from the shell with `mnemosyne store`, its default scope is read **only** from the
+`MNEMOSYNE_DEFAULT_SCOPE` environment variable — it ignores *both* config files and falls back to
+`session`. To store globally from the CLI:
+
+```bash
+MNEMOSYNE_DEFAULT_SCOPE=global mnemosyne store "a durable fact"   # else it lands scope=session
+```
+
+> This is an upstream bug: `mnemosyne config set default_scope global` writes the config file,
+> `mnemosyne config get` reads it back (looks applied), but `store` bypasses the config resolver
+> (`cli.py`: `_resolve_default_scope()` reads only the env var). Reported upstream.
+
+**3. The recall override `MNEMOSYNE_CROSS_SESSION=1` — for legacy session-scoped rows.**
+This drops session filtering entirely (the filter becomes `(1=1)`), so it *additionally* exposes any
+`session`-scoped rows you stored **before** switching to global. Set it only if you have such legacy
+rows, or want the absolute guarantee. Set it via a **systemd drop-in** so it survives
 `hermes gateway install` regenerating the unit (editing the main unit directly gets clobbered):
+
 
 ```bash
 mkdir -p ~/.config/systemd/user/hermes-gateway.service.d

@@ -213,42 +213,49 @@ default `scope=session` fail both conditions, so they vanish cross-session. (Ver
 truth table: `global` recalls cross-session with no env var; `session` does not until the override is
 set.)
 
-**Fix — prefer global scope; use the override only for legacy session rows.**
+**Fix — set the scope on the path that actually writes your memories.** Scope resolution has three
+separate code paths, each reading the default from a *different* source (all verified against source):
 
 ```bash
-# PRIMARY: store durable facts at global scope. Cross-session with NO env var, persists in config.yaml:
-mnemosyne config set default_scope global        # -> "Set default_scope = global"
-mnemosyne config get default_scope               # -> "default_scope = global"
+# 1. AGENT path (mnemosyne_remember — what the agent uses). Read from HERMES config:
+hermes config set memory.mnemosyne.default_scope global
+hermes config get memory.mnemosyne.default_scope     # -> global   (bridge reads THIS key)
 
-# OVERRIDE (only if you have OLD session-scoped rows to surface, or want the belt-and-suspenders):
+# 2. CLI path (mnemosyne store). Reads ONLY the env var, ignores both config files:
+MNEMOSYNE_DEFAULT_SCOPE=global mnemosyne store "a durable fact"   # else lands scope=session
+
+# 3. OVERRIDE for LEGACY session-scoped rows already in the DB (recall-side):
 systemctl --user edit hermes-gateway   # add: Environment=MNEMOSYNE_CROSS_SESSION=1
 systemctl --user daemon-reload && systemctl --user restart hermes-gateway
-# Prove the LIVE process really has it (not just the unit file):
 tr '\0' '\n' < /proc/$(pgrep -u "$USER" -f hermes-gateway | head -1)/environ | grep MNEMOSYNE
 ```
 
-> **⚠️ The `cross_session` *config key* does not work — the override is env-var-only.** It's in
-> Mnemosyne's config map with a `config.yaml > env vars` precedence promise, but the recall path reads
-> `os.environ["MNEMOSYNE_CROSS_SESSION"]` at import time and never consults the config resolver.
-> Verified: `config.get("cross_session")==True` while the recall gate `_cross_session_enabled()==False`.
-> So `cross_session: true` in `config.yaml` silently does nothing; only the env var flips the override.
-> (Reported upstream.) `default_scope: global` is *not* affected — it works through the SQL filter.
+> **⚠️ Two distinct upstream bugs make the naive config command a no-op — do not trust it:**
+> - **`mnemosyne config set default_scope global` does nothing to what gets stored.** The CLI `store`
+>   reads scope only from `MNEMOSYNE_DEFAULT_SCOPE` (`cli.py`: `_resolve_default_scope()`), and the
+>   agent bridge reads `memory.mnemosyne.default_scope` from *Hermes* config — neither reads Mnemosyne's
+>   own `config.yaml` that this command writes. `mnemosyne config get` still reflects it, which is the
+>   trap.
+> - **`cross_session: true` in config is a no-op for recall.** `beam.py` reads `MNEMOSYNE_CROSS_SESSION`
+>   from `os.environ` at import time and never consults the config resolver. Verified:
+>   `config.get("cross_session")==True` while `_cross_session_enabled()==False`. The override works only
+>   via the env var.
 
 ### 3c. CLI `store` scope, and how to actually prove a round-trip
 
 **Symptom.** Freshly migrated facts vanish cross-session even after 3a/3b are fixed.
 
-**Root cause.** Rows stored at the default `scope=session` are invisible across sessions. The fix is to
-store durable facts at **`scope=global`** (via `default_scope: global`, §3b) — that alone makes them
-cross-session. `MNEMOSYNE_CROSS_SESSION=1` is only needed to surface *legacy* rows that were already
+**Root cause.** Rows stored at the default `scope=session` are invisible across sessions. Store durable
+facts at **`scope=global`** — but *how* you set the default depends on which path writes them (§3b): the
+agent uses `memory.mnemosyne.default_scope` in Hermes config; the `mnemosyne store` CLI uses the
+`MNEMOSYNE_DEFAULT_SCOPE` env var. `MNEMOSYNE_CROSS_SESSION=1` is only needed to surface *legacy* rows
 written at session scope before you switched.
 
 > **Do not pass `--scope` to `mnemosyne store`.** `mnemosyne store` is **positional** —
 > `store <content> [source] [importance]`, no flags. `mnemosyne store "fact" --scope global` fails
 > with `Error: importance must be a number: global` (it parses `--scope`→source, `global`→importance)
-> and **stores nothing**. Global scope is a *config* setting (`mnemosyne config set default_scope global`
-> → `~/.hermes/mnemosyne/config.yaml`), not a store-time flag. Confirm it round-trips with
-> `mnemosyne config get default_scope`.
+> and **stores nothing**. From the CLI, set global scope with the `MNEMOSYNE_DEFAULT_SCOPE=global` env
+> var (a store-time flag does not exist).
 
 **Verify the whole chain — prove recall, don't just store.** A `store` that "doesn't error" proves
 nothing; make the row come *back*:
