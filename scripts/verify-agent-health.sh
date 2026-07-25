@@ -73,12 +73,22 @@ fi
 mem_provider="$(grep -E '^\s*provider:\s*mnemosyne' "$CONFIG" | head -1)"
 if [[ -n "$mem_provider" ]]; then
   ok mem.config "memory provider = mnemosyne in config"
-  # CONFIG SAYING 'on' IS NOT ENOUGH — the binary must actually resolve.
-  if command -v mnemosyne >/dev/null 2>&1 || [[ -x "$HOME/.local/bin/mnemosyne" ]] \
-     || ls "$HERMES_HOME"/hermes-agent/venv/bin/mnemosyne >/dev/null 2>&1; then
-    ok mem.binary "mnemosyne CLI resolves (backend installed)"
+  # PRESENCE IS NOT FUNCTION. A wrapper stub existing on disk proves nothing —
+  # that exact 'config says mnemosyne + a file exists' check would have reported
+  # PASS during the original silently-broken state. So probe FUNCTION: ask Hermes
+  # itself whether the memory backend is installed AND available.
+  # Run as the owning account when we're inspecting a different agent's home.
+  if [[ "$acct_user_early" != "$(id -un)" ]]; then
+    mem_status="$(sudo -u "$acct_user_early" -H bash -lc 'timeout 60 hermes memory status 2>/dev/null')"
   else
-    bad mem.binary "provider=mnemosyne but 'mnemosyne' binary NOT found — durable memory is a no-op"
+    mem_status="$(timeout 60 hermes memory status 2>/dev/null)"
+  fi
+  if grep -qE 'Plugin:\s+installed' <<<"$mem_status" && grep -qE 'Status:\s+available' <<<"$mem_status"; then
+    ok mem.binary "memory backend functional (Plugin installed ✓, Status available ✓)"
+  elif [[ -z "$mem_status" ]]; then
+    warn mem.binary "'hermes memory status' returned nothing — could not confirm backend function (run as the agent user)"
+  else
+    bad mem.binary "provider=mnemosyne but backend NOT functional (Plugin/Status not confirmed) — durable memory is a no-op"
   fi
   # DB should exist and be non-trivial
   db="$HERMES_HOME/mnemosyne/data/mnemosyne.db"
@@ -137,6 +147,20 @@ elif [[ -n "$gw_diag" ]]; then
   fi
 else
   warn gw.run "no gateway process and no gateway-exit-diag.log — is the gateway configured?"
+fi
+# Discord session READY — process alive != Discord session logged in.
+# The "Connected as <bot>#<discriminator>" line prints ONLY on discord.py's on_ready;
+# that IS the READY signal. A generic "response ready" line is request-handling noise
+# and does NOT prove login (this exact loose-grep confusion caused a real misdiagnosis).
+gw_log="$HERMES_HOME/logs/gateway.log"
+if [[ -f "$gw_log" ]]; then
+  if grep -qE 'Connected as .+#|discord connected' "$gw_log"; then
+    ok gw.ready "Discord session reached READY ('Connected as ...' present in gateway.log)"
+  else
+    bad gw.ready "no 'Connected as ...' READY line in gateway.log — Discord session not logged in (a live process is NOT proof of READY)"
+  fi
+else
+  warn gw.ready "no gateway.log at $gw_log — cannot confirm Discord READY"
 fi
 # Discord permission wall (MANAGE_MESSAGES / 50013) — an OAuth-invite-scope problem, not a config fix.
 if grep -qiE 'Discord API .*403|code.*50013|Missing Permissions' "$HERMES_HOME"/logs/errors.log 2>/dev/null; then
