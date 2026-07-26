@@ -517,6 +517,21 @@ So if a broken install already **wrote `auto_sleep: false` into `config.yaml`**,
 `MNEMOSYNE_AUTO_SLEEP_ENABLED=true` in `.env` is **silently ignored** — the config key wins. The
 env var only takes effect when there is *no* competing `config.yaml` key.
 
+**The inverse historical trap — very old builds ignore the config key entirely.** Per
+[mnemosyne-oss/mnemosyne#48](https://github.com/mnemosyne-oss/mnemosyne/issues/48) (fixed May 2026,
+commit `2b0a478`), on **pre-fix builds** the `memory.mnemosyne.auto_sleep` key was *advertised in the
+schema but never applied at runtime* — `initialize()` didn't read config and `save_config()` was a
+no-op, so back then **only the env var worked**. The fix added an `_apply_provider_config()` read
+path (kwargs → `config.yaml` → env fallback). So the version-aware truth is:
+
+- **Fixed build (current, post-#48):** the config key is honored and *wins* the precedence race — use it.
+- **Pre-#48 build:** the config key is silently ignored → `MNEMOSYNE_AUTO_SLEEP_ENABLED=true` is the
+  *only* lever that works.
+
+Which is exactly why you **confirm your build honors the key** (set it, restart, look for the
+[§3e](#3e-auto-sleep-actually-fires-only-on-every-10th-turn--the-non-obvious-gate) journal line)
+rather than assume — and why the env var below is worth setting as a fallback regardless.
+
 **Fix it in the right layer (in priority order):**
 
 1. **Preferred — set the config key** (this is a behavioral setting, and it wins the precedence
