@@ -411,6 +411,15 @@ echo 'FIRECRAWL_API_URL=http://localhost:3002' >> ~/.hermes/.env
 
 ### Hosting the local Firecrawl container stack
 
+> **First, decide whether you even need to host it.** On a **shared host**, only **one** agent runs the
+> Firecrawl stack; every other agent on the box just points `FIRECRAWL_API_URL` at the existing one —
+> **no clone, no second stack.** On our box the stack is hosted once under the first agent's user
+> (`/home/videau-ai/services/firecrawl/`, port `:3002`), and the second agent (`deirdre-ai`) consumes it
+> purely as a **client** — there is no `~/services/firecrawl` under the second user at all. Following the
+> recipe below on a second agent would spin up a *redundant* 5-container stack or collide on `:3002`.
+> So: **host once per box, point every other agent at it.** The steps below are for the **one** agent
+> that hosts it (or a single-agent box).
+
 Self-hosted Firecrawl is a small **multi-container** stack (not a single image): the API plus Redis,
 RabbitMQ, a Postgres (`nuq-postgres`), and a Playwright browser service. On ARM64 (DGX Spark / GB10)
 **don't build from source** — use the published `arm64` images via a compose override.
@@ -465,6 +474,13 @@ docker compose ps
 curl -s http://localhost:3002/ ; echo
 # Expect: {"message":"Firecrawl API","documentation_url":"https://docs.firecrawl.dev"}
 ```
+
+> **Scope caveat (honesty note).** The *running* stack, the override file, and the `:3002` health check
+> above are verified against ground truth on `piment`. The from-scratch cold-start — `git clone` +
+> `cp apps/api/.env.example .env` + first `docker compose up -d` on a genuinely **fresh** box — is
+> **not** independently clean-room tested here; both our agents verified against an
+> already-running stack. Treat the clone/env steps as the documented-but-unproven path and expect to
+> read Firecrawl's own self-host docs if a fresh bring-up hiccups.
 
 ### Verify — prove BOTH capabilities end-to-end (don't assume)
 
