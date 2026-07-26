@@ -17,6 +17,9 @@
 1. [Model & Provider Wiring — the silent-downgrade trap](#1-model--provider-wiring--the-silent-downgrade-trap)
 2. [Fallback Chain — redundancy in hardware is not redundancy in config](#2-fallback-chain--redundancy-in-hardware-is-not-redundancy-in-config)
 3. [Memory (Mnemosyne) — the three-way break](#3-memory-mnemosyne--the-three-way-break)
+   - [3d. Consolidation → local vLLM (not CPU llama-cpp)](#3d-consolidation-summaries--route-them-to-your-local-vllm-not-cpu-llama-cpp)
+   - [3e. Auto-sleep fires only every 10th turn — the gate](#3e-auto-sleep-actually-fires-only-on-every-10th-turn--the-non-obvious-gate)
+   - [3f. Where the `MNEMOSYNE_*` env vars go (`.env`, not a drop-in)](#3f-where-the-mnemosyne_-env-vars-actually-go--and-how-to-verify-them)
 4. [Backups — an untested backup is not a backup](#4-backups--an-untested-backup-is-not-a-backup)
 5. [Web Search & Extraction — free DDG search + self-hosted Firecrawl](#45-web-search--extraction--free-ddg-search--self-hosted-firecrawl)
 6. [Discord — roles and permissions](#5-discord--roles-and-permissions)
@@ -229,6 +232,9 @@ MNEMOSYNE_DEFAULT_SCOPE=global mnemosyne store "a durable fact"   # else lands s
 systemctl --user edit hermes-gateway   # add: Environment=MNEMOSYNE_CROSS_SESSION=1
 systemctl --user daemon-reload && systemctl --user restart hermes-gateway
 tr '\0' '\n' < /proc/$(pgrep -u "$USER" -f hermes-gateway | head -1)/environ | grep MNEMOSYNE
+# NOTE: /proc/<pid>/environ only shows vars set via the systemd drop-in / exec-time env.
+# If you instead put MNEMOSYNE_CROSS_SESSION in ~/.hermes/.env, it will NOT appear here even
+# though the process has it — see §3f for why, and for the correct .env verification probe.
 ```
 
 > **⚠️ Two distinct upstream bugs make the naive config command a no-op — do not trust it:**
@@ -279,6 +285,171 @@ hermes mnemosyne stats                               # count should include the 
 To prove it survives the cross-session boundary specifically, recall it from a *fresh* agent session
 and confirm the live gateway (which carries the env var) sees it too — if the CLI recalls it but the
 gateway doesn't, that's a §3b env-var gap, not a store problem.
+
+### 3d. Consolidation summaries — route them to your local vLLM, not CPU llama-cpp
+
+**Symptom.** Memory *consolidation* (the "sleep" pass that compresses working memories into episodic
+summaries) is slow — minutes per batch — and the resulting "summary" is garbage: raw `<think>`
+reasoning tokens leaked verbatim instead of a clean summary.
+
+**Root cause.** Mnemosyne's **default** consolidation LLM is a CPU llama-cpp GGUF. It's slow on a
+box whose GPU is already serving a good model, and a reasoning GGUF emits `<think>` sludge that the
+cleaner doesn't fully strip. Meanwhile the local vLLM you already stood up for the agent (§1) is
+sitting right there, idle for this purpose.
+
+**Fix — point consolidation at the local vLLM (no API key needed).** The selection lives in
+`mnemosyne/core/local_llm.py::summarize_memories()`. The remote-API path fires when
+`MNEMOSYNE_LLM_BASE_URL` is set **and** `MNEMOSYNE_LLM_ENABLED` is not false — verified against source:
+
+```python
+# mnemosyne/core/local_llm.py, inside summarize_memories()  (line ~622)
+if LLM_ENABLED and LLM_BASE_URL and not os.environ.get("MNEMOSYNE_FORCE_LOCAL", ...):
+    raw = _call_remote_llm(prompt)      # ← OpenAI-compatible call to your vLLM
+```
+
+`LLM_ENABLED` **defaults to `true`** (`local_llm.py:23`), so in practice *just setting the base URL*
+is enough to switch consolidation onto vLLM. Set these three (see [§3f](#3f-where-the-mnemosyne_-env-vars-actually-go--and-how-to-verify-them) for **where** they go):
+
+```bash
+MNEMOSYNE_LLM_ENABLED=true
+MNEMOSYNE_LLM_BASE_URL=http://localhost:8000/v1     # your vLLM OpenAI endpoint
+MNEMOSYNE_LLM_MODEL=<served-model-name>             # e.g. qwen — the name vLLM serves
+```
+
+vLLM needs **no API key** for a local, unauthenticated endpoint. Measured A/B on our boxes: vLLM
+(`qwen`) produced a faithful ~450-char summary in **~16 s**; the CPU GGUF took **~21 s+** and emitted
+`<think>` sludge with no usable output.
+
+> **⚠️ Footgun: `MNEMOSYNE_FORCE_LOCAL`.** Setting `MNEMOSYNE_FORCE_LOCAL=1` (or `true`/`yes`) forces
+> consolidation **back** to the CPU GGUF *even when the base URL is set* (`local_llm.py:622` short-
+> circuits the remote path). If you set it "just to test the local path," clear it afterward — a stray
+> `MNEMOSYNE_FORCE_LOCAL` is a silent way to end up back on the slow, `<think>`-leaking path.
+
+**One-time backfill (bypass the turn gate in [§3e](#3e-auto-sleep-actually-fires-only-on-every-10th-turn--the-non-obvious-gate)).** To consolidate a
+backlog *right now* without waiting for the auto-sleep trigger, run a fresh subprocess with the env
+vars set (a fresh process gets a fresh reflect budget and doesn't need the live turn counter):
+
+```bash
+# From the agent's Hermes venv, with the MNEMOSYNE_LLM_* vars exported:
+python - <<'PY'
+from mnemosyne.core import memory as M
+M.sleep_all_sessions(dry_run=False, force=True)   # force=True ignores the age cutoff
+PY
+```
+
+> `force=True` sets the age cutoff to "everything," so it consolidates all unconsolidated working
+> rows regardless of age; `sleep_all_sessions` (vs `sleep`) walks **every** session, not just the
+> current one — the right choice when your working rows are spread across many Discord-thread/CLI
+> sessions. Over a dozen sessions with a 30B-class reasoning model this can exceed a few minutes;
+> run it in the background rather than a short foreground timeout.
+
+**Verify — confirm the remote path actually ran.** Don't infer it from timing alone:
+
+```bash
+# During a consolidation run, confirm an ESTABLISHED socket to the vLLM port:
+ss -tnp | grep :8000
+# And spot-check a fresh episodic summary is clean prose, NOT <think>...:
+sqlite3 ~/.hermes/mnemosyne/data/mnemosyne.db \
+  "SELECT substr(content,1,120) FROM episodic_memory ORDER BY rowid DESC LIMIT 1;"
+```
+
+> An `hf_hub_download` / "unauthenticated HF Hub" warning during the run is **noise**, not proof the
+> local GGUF was used — Mnemosyne lazily probes the local tokenizer to size chunks even when the
+> remote path handles the actual summary. Confirm the remote path by the live socket to vLLM and by
+> clean summary text, not by the absence of that warning.
+
+### 3e. Auto-sleep actually fires only on every 10th turn — the non-obvious gate
+
+**Symptom.** A freshly-restarted, *correctly-wired* gateway shows `episodic: 0` even though
+`working > 50`. It looks like consolidation is broken. It isn't.
+
+**Root cause — the turn-count gate.** Consolidation is built in (no cron needed), but the auto-sleep
+trigger is gated on a **per-session turn counter**. From the bridge (`mnemosyne_hermes/__init__.py`,
+verified against source):
+
+```python
+self._turn_count = 0                                  # __init__ (line ~552) — resets every restart
+...
+self._turn_count += 1                                 # every turn (line ~1318)
+if self._auto_sleep_enabled and self._turn_count % 10 == 0:
+    self._maybe_auto_sleep()                          # threshold only CHECKED on turns 10, 20, 30…
+```
+
+So:
+
+- Auto-sleep **only even checks** the threshold on every **10th turn** of a live session.
+- `turn_count` is **per-session** and **resets to 0 on every gateway restart**.
+- Therefore a freshly-restarted gateway with `< 10` turns will show `episodic: 0` even with
+  `working > 50`. **That is the turn gate, not a wiring bug.**
+
+**There is a second, quieter no-op** worth knowing so you don't misdiagnose it as the gate: even on a
+turn that *is* a multiple of 10 with `working > threshold`, `_maybe_auto_sleep()` returns **without
+logging anything** if the eligibility check finds **zero** unconsolidated rows older than `TTL/2`
+(`__init__.py` ~1393–1396) — i.e. everything old is already consolidated. So `episodic: 0` +
+`working > 50` + no journal line has **two** innocent causes: (1) `< 10` turns since restart, or
+(2) nothing is actually eligible yet.
+
+**Confirm it's the gate, not a config break.** Grep the gateway journal for the auto-sleep line
+(`__init__.py` ~1403). Its **presence** proves the trigger fired; its **absence** means either
+`< 10` turns since restart or nothing eligible — not a broken config:
+
+```bash
+journalctl --user -u hermes-gateway | grep "Mnemosyne auto-sleep:"
+# A hit looks like:  Mnemosyne auto-sleep: working=63, eligible=41 > threshold=50
+# Absent  ⇒  <10 turns since restart (the gate) OR nothing eligible — NOT a wiring fault.
+```
+
+> **Defaults & knobs (verified):** the threshold is `working > 50` (`__init__.py:569`, config key
+> `sleep_threshold`); auto-sleep is on by default (`auto_sleep`, config key / legacy
+> `MNEMOSYNE_AUTO_SLEEP_ENABLED`). When it does fire it runs `sleep_all_sessions` (cross-session) in
+> a daemon thread. To consolidate immediately without waiting out ten turns, use the one-time
+> backfill in [§3d](#3d-consolidation-summaries--route-them-to-your-local-vllm-not-cpu-llama-cpp).
+
+### 3f. Where the `MNEMOSYNE_*` env vars actually go — and how to verify them
+
+**These are env vars → they live in `~/.hermes/.env`, *not* a systemd drop-in.** Hermes' hard
+invariant: behavioral *settings* go in `config.yaml` (via `hermes config set`, which is write-guarded);
+*env vars / secrets* go in `~/.hermes/.env`. The `MNEMOSYNE_*` knobs are env vars, so they belong in
+`.env`.
+
+**Why `.env` and not a drop-in — verified against source.** `gateway/run.py` calls
+`load_hermes_dotenv(...)` at **module-import time** (`run.py:1509`), and the loader applies the user
+`.env` with **`override=True`** (`hermes_cli/env_loader.py:327`). That runs **before** the Mnemosyne
+bridge imports `mnemosyne/core/local_llm.py`, whose `LLM_BASE_URL` / `LLM_ENABLED` / `LLM_MODEL` are
+**module-level constants read once at import** (`local_llm.py:23,36,38`). So `.env` populates
+`os.environ` in time for those constants to pick up your values. A systemd `Environment=` drop-in also
+works, but `.env` is **portable across launch methods** (CLI, gateway, one-off subprocess) while a
+drop-in only applies under that exact unit — so `.env` is the canonical, single-source home.
+
+```bash
+# ~/.hermes/.env  (direct edit is sanctioned — .env is not write-guarded; no CLI writes it.
+#  `hermes config env-path` only PRINTS the path.)
+MNEMOSYNE_LLM_ENABLED=true
+MNEMOSYNE_LLM_BASE_URL=http://localhost:8000/v1
+MNEMOSYNE_LLM_MODEL=qwen
+```
+
+> **Hygiene:** if the same var is *also* exported from a systemd drop-in **and** `~/.profile` **and**
+> `~/.bashrc`, you get four sources of truth and inevitable drift. Consolidate to `~/.hermes/.env`
+> and comment out the rest.
+
+> **⚠️ Verification gotcha — do NOT check `.env`-loaded vars via `/proc/<pid>/environ`.** That file is
+> an **exec-time snapshot**: it reflects only what was in the environment when the process was `exec`'d.
+> `load_hermes_dotenv()` mutates `os.environ` **at runtime**, and that mutation is **invisible** to
+> `/proc/<pid>/environ` — so a var loaded from `.env` reads as "missing" there even though the process
+> genuinely has it. (This means the `/proc/.../environ` check suggested in §3b is only reliable for a
+> var set via a systemd `Environment=` drop-in — **not** for one living in `.env`.) The correct probe
+> replays the loader in a clean environment and prints what it resolves:
+
+```bash
+# From the agent's Hermes venv dir. Proves what .env actually loads — independent of /proc.
+env -i HOME=/home/<user> HERMES_HOME=/home/<user>/.hermes PATH=/usr/bin:/bin \
+  ./venv/bin/python -c "import os; from pathlib import Path; \
+from hermes_cli.env_loader import load_hermes_dotenv; \
+load_hermes_dotenv(hermes_home=Path(os.environ['HERMES_HOME']), project_env=None); \
+print({k: os.environ.get(k) for k in \
+  ('MNEMOSYNE_CROSS_SESSION','MNEMOSYNE_LLM_ENABLED','MNEMOSYNE_LLM_BASE_URL','MNEMOSYNE_LLM_MODEL')})"
+```
 
 ---
 
@@ -578,6 +749,10 @@ Before you call a second agent "done," each of these must be **proven**, not ass
       (saw the "🔄 Switched to fallback model" line).
 - [ ] **Memory.** `hermes memory status` → `Plugin: installed ✓`; `MNEMOSYNE_CROSS_SESSION=1` in the
       live process env; canary fact recalled from a fresh session; durable facts `scope=global`.
+- [ ] **Consolidation.** `MNEMOSYNE_LLM_BASE_URL` points at the local vLLM in `~/.hermes/.env` (not a
+      drop-in); a fresh episodic summary is clean prose (no `<think>` leak); the auto-sleep journal
+      line appears after ≥10 turns, or a forced `sleep_all_sessions(force=True)` backfill produced
+      episodic rows.
 - [ ] **Backup.** Encrypted archive pushed off-box on a cron; **restored from the cloud copy** and
       `PRAGMA integrity_check` = `ok`; passphrase pinned off-box; negative test fails loud.
 - [ ] **Web.** `import ddgs` succeeds in the venv; `FIRECRAWL_API_URL` (bare origin, no `/v1`) set and
