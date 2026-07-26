@@ -18,7 +18,8 @@
 2. [Fallback Chain — redundancy in hardware is not redundancy in config](#2-fallback-chain--redundancy-in-hardware-is-not-redundancy-in-config)
 3. [Memory (Mnemosyne) — the three-way break](#3-memory-mnemosyne--the-three-way-break)
 4. [Backups — an untested backup is not a backup](#4-backups--an-untested-backup-is-not-a-backup)
-5. [Discord — roles and permissions](#5-discord--roles-and-permissions)
+5. [Web Search & Extraction — free DDG search + self-hosted Firecrawl](#45-web-search--extraction--free-ddg-search--self-hosted-firecrawl)
+6. [Discord — roles and permissions](#5-discord--roles-and-permissions)
 6. [Account & Identity Isolation](#6-account--identity-isolation)
 7. [The Five-Point Pre-Flight Checklist](#7-the-five-point-pre-flight-checklist)
 
@@ -339,6 +340,154 @@ than none.
 
 ---
 
+## 4.5. Web Search & Extraction — free DDG search + self-hosted Firecrawl
+
+**Symptom.** The agent can't search the web, or you assume you need a paid search API key
+(Tavily/Exa/Brave/Parallel) to give it eyes on the internet. You don't.
+
+**Root cause / the mental model.** Hermes splits web capability into two independent axes, each with
+its own backend selector, and Hermes picks a backend by *availability*, not by a key you bought:
+
+- `web.backend` — the shared default for both capabilities.
+- `web.search_backend` — override for `web_search` only. **If empty, it falls back to `web.backend`.**
+- `web.extract_backend` — override for `web_extract` only. Same fallback rule.
+
+The fallback is literal (`tools/web_tools.py`, `_get_capability_backend()`):
+
+```python
+specific = (cfg.get(f"{capability}_backend") or "").lower().strip()
+if specific and _is_backend_available(specific):
+    return specific
+return _get_backend()          # falls back to web.backend
+```
+
+**The sensible, zero-paid-key split** (this is what both our agents run):
+
+```bash
+hermes config set web.backend ddgs                 # search via DuckDuckGo
+hermes config set web.extract_backend firecrawl    # extract via self-hosted Firecrawl
+hermes config set web.search_backend ""            # empty → inherits web.backend (ddgs)
+```
+
+```yaml
+# ~/.hermes/config.yaml
+web:
+  backend: ddgs
+  search_backend: ''        # empty on purpose — inherits web.backend
+  extract_backend: firecrawl
+```
+
+### Gotcha 1 — `ddgs` is a PYTHON PACKAGE, not an API
+
+There is **no key and no endpoint** for DuckDuckGo search. `ddgs` is a pip package that scrapes DDG;
+Hermes treats the backend as available **iff `import ddgs` succeeds** — nothing else. (In
+`web_tools.py`, `ddgs` is the *only* backend whose availability is a package-import probe rather than
+an env-var/key check.) So the entire "setup" is:
+
+```bash
+# inside the agent's Hermes venv
+pip install ddgs
+python -c "import ddgs; print('ddgs', ddgs.__version__)"   # prove the import works
+```
+
+> Do **not** mistake DuckDuckGo for a "free API endpoint" — there isn't one. The package does the
+> work locally. If `import ddgs` fails, Hermes silently treats the backend as unavailable and your
+> search falls through to whatever else is configured (often nothing).
+
+### Gotcha 2 — Firecrawl extract points at a **self-hosted** instance, no key
+
+`web_extract` uses Firecrawl, but pointed at a **local** Firecrawl you host yourself — free, private,
+no rate-limited SaaS key. Firecrawl is considered available when **either** `FIRECRAWL_API_KEY`
+**or** `FIRECRAWL_API_URL` is set (`web_tools.py:245`), so the URL alone is enough:
+
+```bash
+# Base ORIGIN only — no /v1 suffix, no key.
+echo 'FIRECRAWL_API_URL=http://localhost:3002' >> ~/.hermes/.env
+```
+
+> **Two footguns:** (1) use the bare origin `http://localhost:3002` — **not** `.../v1`; Hermes appends
+> the path itself, and a `/v1` suffix double-paths the request. (2) `FIRECRAWL_API_URL` is a genuine
+> credential-adjacent endpoint, so it lives in `~/.hermes/.env`, not `config.yaml`.
+
+### Hosting the local Firecrawl container stack
+
+Self-hosted Firecrawl is a small **multi-container** stack (not a single image): the API plus Redis,
+RabbitMQ, a Postgres (`nuq-postgres`), and a Playwright browser service. On ARM64 (DGX Spark / GB10)
+**don't build from source** — use the published `arm64` images via a compose override.
+
+```bash
+# 1. Clone the repo somewhere stable (we keep services under ~/services)
+mkdir -p ~/services && cd ~/services
+git clone https://github.com/firecrawl/firecrawl.git
+cd firecrawl
+
+# 2. Env: copy the example and keep it minimal for self-host
+cp apps/api/.env.example .env    # self-host defaults are fine; USE_DB_AUTHENTICATION=false
+```
+
+Add an override so Docker pulls prebuilt arm64 images instead of compiling (this is exactly the file
+we run on `piment`):
+
+```yaml
+# ~/services/firecrawl/docker-compose.override.yaml
+# Override: use published arm64 images instead of building from source.
+name: firecrawl
+services:
+  api:
+    build: !reset null
+    image: ghcr.io/firecrawl/firecrawl:latest
+  playwright-service:
+    build: !reset null
+    image: ghcr.io/firecrawl/playwright-service:latest
+  nuq-postgres:
+    build: !reset null
+    image: ghcr.io/firecrawl/nuq-postgres:latest
+```
+
+```bash
+# 3. Bring the stack up detached; it publishes the API on :3002
+docker compose up -d
+
+# 4. Confirm all five containers are Up
+docker compose ps
+# Expect: firecrawl-api-1, firecrawl-redis-1, firecrawl-rabbitmq-1,
+#         firecrawl-nuq-postgres-1, firecrawl-playwright-service-1  — all "Up"
+```
+
+> The API container binds `0.0.0.0:3002->3002` via `docker-proxy`, which is why
+> `FIRECRAWL_API_URL=http://localhost:3002` works from the host even though the agent runs outside the
+> compose network. If you firewall the box, `:3002` should stay host-local — it's an unauthenticated
+> endpoint by design in the self-host config.
+
+**Verify — the container answers before you blame Hermes:**
+
+```bash
+curl -s http://localhost:3002/ ; echo
+# Expect: {"message":"Firecrawl API","documentation_url":"https://docs.firecrawl.dev"}
+```
+
+### Verify — prove BOTH capabilities end-to-end (don't assume)
+
+A configured backend is a hypothesis until a live query returns real content. Ask the running agent
+to actually use each path:
+
+```bash
+# Search (ddgs): must return live, real URLs — not an "no backend available" error.
+hermes chat -q "Use web_search for 'NVIDIA DGX Spark GB10 specifications' and list 3 result URLs."
+
+# Extract (self-hosted firecrawl): must return page text with no error.
+hermes chat -q "Use web_extract on https://example.com and quote the first sentence."
+```
+
+Both must come back with genuine content. On our boxes: DDG search returns live results end-to-end,
+and extract pulls page text straight from the local Firecrawl with no key and no SaaS round-trip.
+
+> **The through-line for this axis:** "a search key costs money" is a false assumption. `ddgs`
+> (package, no key) + self-hosted Firecrawl (`FIRECRAWL_API_URL`, no key) gives a second agent full
+> web eyes for **$0** and keeps every fetch private to the box.
+
+---
+
 ## 5. Discord — roles and permissions
 
 **Symptom.** The second bot doesn't render as a server member and can't pin
@@ -415,6 +564,9 @@ Before you call a second agent "done," each of these must be **proven**, not ass
       live process env; canary fact recalled from a fresh session; durable facts `scope=global`.
 - [ ] **Backup.** Encrypted archive pushed off-box on a cron; **restored from the cloud copy** and
       `PRAGMA integrity_check` = `ok`; passphrase pinned off-box; negative test fails loud.
+- [ ] **Web.** `import ddgs` succeeds in the venv; `FIRECRAWL_API_URL` (bare origin, no `/v1`) set and
+      the local Firecrawl stack answers on `:3002`; live `web_search` returns real URLs and
+      `web_extract` returns page text — both with **no paid key**.
 - [ ] **Discord.** Bot has a managed role (`member_info` shows a non-empty `roles`); the exact
       privileged action that failed now succeeds (pin/unpin); gateway log shows a `Connected as …`
       READY line (not a generic `response ready` line).
