@@ -20,6 +20,7 @@
    - [3d. Consolidation → local vLLM (not CPU llama-cpp)](#3d-consolidation-summaries--route-them-to-your-local-vllm-not-cpu-llama-cpp)
    - [3e. Auto-sleep fires only every 10th turn — the gate](#3e-auto-sleep-actually-fires-only-on-every-10th-turn--the-non-obvious-gate)
    - [3f. Where the `MNEMOSYNE_*` env vars go (`.env`, not a drop-in)](#3f-where-the-mnemosyne_-env-vars-actually-go--and-how-to-verify-them)
+   - [3g. The `auto_sleep`-defaults-to-false bug — and why the env var alone may not fix it](#3g-the-auto_sleep-defaults-to-false-bug--and-why-the-env-var-alone-may-not-fix-it)
 4. [Backups — an untested backup is not a backup](#4-backups--an-untested-backup-is-not-a-backup)
 5. [Web Search & Extraction — free DDG search + self-hosted Firecrawl](#45-web-search--extraction--free-ddg-search--self-hosted-firecrawl)
 6. [Discord — roles and permissions](#5-discord--roles-and-permissions)
@@ -483,6 +484,64 @@ load_hermes_dotenv(hermes_home=Path(os.environ['HERMES_HOME']), project_env=None
 print({k: os.environ.get(k) for k in \
   ('MNEMOSYNE_CROSS_SESSION','MNEMOSYNE_LLM_ENABLED','MNEMOSYNE_LLM_BASE_URL','MNEMOSYNE_LLM_MODEL')})"
 ```
+
+### 3g. The `auto_sleep`-defaults-to-false bug — and why the env var alone may not fix it
+
+There was a real bug where the Hermes Mnemosyne plugin's config schema set `auto_sleep`'s
+default to **`False`**, overriding Mnemosyne core's default of `True`. On an affected fresh
+install, memory *appears* to work but **never consolidates** — the agent quietly keeps forgetting
+cross-session context. Tracked as [NousResearch/hermes-agent#59836](https://github.com/NousResearch/hermes-agent/issues/59836);
+first patch attempt [mnemosyne-oss/mnemosyne#420](https://github.com/mnemosyne-oss/mnemosyne/pull/420)
+(flipped the schema line but left a runtime fallback gap), **superseded by the merged full fix
+[#429](https://github.com/mnemosyne-oss/mnemosyne/pull/429)** which covers both provider surfaces
+plus regression tests.
+
+**Are you affected? Check the effective default on *your* installed version — don't assume.**
+
+```bash
+# Grep the schema default in your actually-installed plugin (path varies; find it first):
+python -c "import mnemosyne_hermes, os; print(os.path.dirname(mnemosyne_hermes.__file__))"
+grep -n '"key": "auto_sleep"' "$(python -c 'import mnemosyne_hermes,os;print(os.path.dirname(mnemosyne_hermes.__file__))')/__init__.py"
+# Fixed version reads:  ... "default": True  (description: "Set false to disable")
+# Buggy version reads:  ... "default": False (description: "Set true to enable")
+```
+
+**The load-bearing detail: resolution order. `config.yaml` beats the env var.** In the plugin,
+`auto_sleep` is resolved (verified — `grep -n 'auto_sleep = kwargs.get' __init__.py`, read the block):
+
+```
+kwargs  >  config.yaml key  >  MNEMOSYNE_AUTO_SLEEP_ENABLED env var  >  hardcoded schema default
+```
+
+So if a broken install already **wrote `auto_sleep: false` into `config.yaml`**, then setting
+`MNEMOSYNE_AUTO_SLEEP_ENABLED=true` in `.env` is **silently ignored** — the config key wins. The
+env var only takes effect when there is *no* competing `config.yaml` key.
+
+**Fix it in the right layer (in priority order):**
+
+1. **Preferred — set the config key** (this is a behavioral setting, and it wins the precedence
+   race). Check what you have, then set it true:
+   ```bash
+   grep -n 'auto_sleep' ~/.hermes/config.yaml || echo "no auto_sleep key — env var/default governs"
+   # If it's present and false (or you want to be explicit), set it true:
+   hermes config set memory.mnemosyne.auto_sleep true
+   ```
+2. **Belt-and-suspenders — the env var**, for installs/versions where the config path isn't wired
+   or the key is absent. Add to `~/.hermes/.env` (see [§3f](#3f-where-the-mnemosyne_-env-vars-actually-go--and-how-to-verify-them)
+   for why `.env` and how to verify):
+   ```bash
+   MNEMOSYNE_AUTO_SLEEP_ENABLED=true
+   ```
+   It's harmless on already-fixed versions (the fixed default is `True` anyway), and it's the actual
+   workaround on pre-#429 builds — **but only when no `config.yaml auto_sleep` key shadows it.**
+
+> **Verify the whole chain, don't trust one layer.** After changing either, confirm the *effective*
+> value by grepping `~/.hermes/config.yaml` for the key **and** confirming the env var resolves from
+> `.env` (the [§3f](#3f-where-the-mnemosyne_-env-vars-actually-go--and-how-to-verify-them) clean-env
+> probe), then **restart the gateway** — like every `MNEMOSYNE_*` change, this only takes effect on
+> the next restart (the running gateway read its env at startup). Proof it worked is the auto-sleep
+> journal line from [§3e](#3e-auto-sleep-actually-fires-only-on-every-10th-turn--the-non-obvious-gate),
+> not the fact that you set a flag.
 
 ---
 
