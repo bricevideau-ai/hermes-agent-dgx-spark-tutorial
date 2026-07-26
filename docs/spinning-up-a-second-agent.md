@@ -299,16 +299,24 @@ sitting right there, idle for this purpose.
 
 **Fix — point consolidation at the local vLLM (no API key needed).** The selection lives in
 `mnemosyne/core/local_llm.py::summarize_memories()`. The remote-API path fires when
-`MNEMOSYNE_LLM_BASE_URL` is set **and** `MNEMOSYNE_LLM_ENABLED` is not false — verified against source:
+`MNEMOSYNE_LLM_BASE_URL` is set **and** `MNEMOSYNE_LLM_ENABLED` is not false — verified against source
+(find it in your own tree, since line numbers drift between releases):
+
+```bash
+# Locate the remote-path condition by symbol, not by line number:
+python -c "import mnemosyne.core.local_llm as m; print(m.__file__)"   # -> path to local_llm.py
+grep -n "def summarize_memories\|MNEMOSYNE_FORCE_LOCAL\|LLM_ENABLED and LLM_BASE_URL" <that path>
+```
 
 ```python
-# mnemosyne/core/local_llm.py, inside summarize_memories()  (line ~622)
+# mnemosyne/core/local_llm.py, inside summarize_memories()
 if LLM_ENABLED and LLM_BASE_URL and not os.environ.get("MNEMOSYNE_FORCE_LOCAL", ...):
     raw = _call_remote_llm(prompt)      # ← OpenAI-compatible call to your vLLM
 ```
 
-`LLM_ENABLED` **defaults to `true`** (`local_llm.py:23`), so in practice *just setting the base URL*
-is enough to switch consolidation onto vLLM. Set these three (see [§3f](#3f-where-the-mnemosyne_-env-vars-actually-go--and-how-to-verify-them) for **where** they go):
+`LLM_ENABLED` **defaults to `true`** (`grep -n '^LLM_ENABLED' local_llm.py` → `os.environ.get("MNEMOSYNE_LLM_ENABLED", "true")`),
+so in practice *just setting the base URL* is enough to switch consolidation onto vLLM. Set these
+three (see [§3f](#3f-where-the-mnemosyne_-env-vars-actually-go--and-how-to-verify-them) for **where** they go):
 
 ```bash
 MNEMOSYNE_LLM_ENABLED=true
@@ -321,9 +329,10 @@ vLLM needs **no API key** for a local, unauthenticated endpoint. Measured A/B on
 `<think>` sludge with no usable output.
 
 > **⚠️ Footgun: `MNEMOSYNE_FORCE_LOCAL`.** Setting `MNEMOSYNE_FORCE_LOCAL=1` (or `true`/`yes`) forces
-> consolidation **back** to the CPU GGUF *even when the base URL is set* (`local_llm.py:622` short-
-> circuits the remote path). If you set it "just to test the local path," clear it afterward — a stray
-> `MNEMOSYNE_FORCE_LOCAL` is a silent way to end up back on the slow, `<think>`-leaking path.
+> consolidation **back** to the CPU GGUF *even when the base URL is set* — it's the `not os.environ.get("MNEMOSYNE_FORCE_LOCAL"...)`
+> clause in the `summarize_memories()` condition above that short-circuits the remote path. If you set
+> it "just to test the local path," clear it afterward — a stray `MNEMOSYNE_FORCE_LOCAL` is a silent way
+> to end up back on the slow, `<think>`-leaking path.
 
 **One-time backfill (bypass the turn gate in [§3e](#3e-auto-sleep-actually-fires-only-on-every-10th-turn--the-non-obvious-gate)).** To consolidate a
 backlog *right now* without waiting for the auto-sleep trigger, run a fresh subprocess with the env
@@ -364,13 +373,22 @@ sqlite3 ~/.hermes/mnemosyne/data/mnemosyne.db \
 `working > 50`. It looks like consolidation is broken. It isn't.
 
 **Root cause — the turn-count gate.** Consolidation is built in (no cron needed), but the auto-sleep
-trigger is gated on a **per-session turn counter**. From the bridge (`mnemosyne_hermes/__init__.py`,
-verified against source):
+trigger is gated on a **per-session turn counter**. It lives in the **Mnemosyne↔Hermes bridge**, not
+in `gateway/run.py` or `run_agent.py` — find it by symbol (line numbers drift between releases, and
+this file churns):
+
+```bash
+# Locate the bridge and the gate, in your own tree:
+python -c "import mnemosyne_hermes, os; print(os.path.dirname(mnemosyne_hermes.__file__))"
+grep -n "_turn_count\|% 10\|_maybe_auto_sleep\|_auto_sleep_threshold\|auto-sleep: working" \
+  <that dir>/__init__.py
+```
 
 ```python
-self._turn_count = 0                                  # __init__ (line ~552) — resets every restart
+# mnemosyne_hermes/__init__.py — the gate (symbol-anchored, not line-anchored):
+self._turn_count = 0                                  # in __init__ — resets every restart
 ...
-self._turn_count += 1                                 # every turn (line ~1318)
+self._turn_count += 1                                 # every turn
 if self._auto_sleep_enabled and self._turn_count % 10 == 0:
     self._maybe_auto_sleep()                          # threshold only CHECKED on turns 10, 20, 30…
 ```
@@ -384,14 +402,14 @@ So:
 
 **There is a second, quieter no-op** worth knowing so you don't misdiagnose it as the gate: even on a
 turn that *is* a multiple of 10 with `working > threshold`, `_maybe_auto_sleep()` returns **without
-logging anything** if the eligibility check finds **zero** unconsolidated rows older than `TTL/2`
-(`__init__.py` ~1393–1396) — i.e. everything old is already consolidated. So `episodic: 0` +
-`working > 50` + no journal line has **two** innocent causes: (1) `< 10` turns since restart, or
+logging anything** if the eligibility check (`_count_unconsolidated_before(cutoff)`, where `cutoff`
+is `now − TTL/2`) finds **zero** rows — i.e. everything old is already consolidated. So `episodic: 0`
++ `working > 50` + no journal line has **two** innocent causes: (1) `< 10` turns since restart, or
 (2) nothing is actually eligible yet.
 
-**Confirm it's the gate, not a config break.** Grep the gateway journal for the auto-sleep line
-(`__init__.py` ~1403). Its **presence** proves the trigger fired; its **absence** means either
-`< 10` turns since restart or nothing eligible — not a broken config:
+**Confirm it's the gate, not a config break.** Grep the gateway journal for the auto-sleep log line.
+Its **presence** proves the trigger fired; its **absence** means either `< 10` turns since restart or
+nothing eligible — not a broken config:
 
 ```bash
 journalctl --user -u hermes-gateway | grep "Mnemosyne auto-sleep:"
@@ -399,11 +417,11 @@ journalctl --user -u hermes-gateway | grep "Mnemosyne auto-sleep:"
 # Absent  ⇒  <10 turns since restart (the gate) OR nothing eligible — NOT a wiring fault.
 ```
 
-> **Defaults & knobs (verified):** the threshold is `working > 50` (`__init__.py:569`, config key
-> `sleep_threshold`); auto-sleep is on by default (`auto_sleep`, config key / legacy
-> `MNEMOSYNE_AUTO_SLEEP_ENABLED`). When it does fire it runs `sleep_all_sessions` (cross-session) in
-> a daemon thread. To consolidate immediately without waiting out ten turns, use the one-time
-> backfill in [§3d](#3d-consolidation-summaries--route-them-to-your-local-vllm-not-cpu-llama-cpp).
+> **Defaults & knobs (verified — grep, don't trust a line number):** the threshold is `working > 50`
+> (`grep -n '_auto_sleep_threshold = ' __init__.py` → `= 50`; config key `sleep_threshold`); auto-sleep
+> is on by default (config key `auto_sleep` / legacy `MNEMOSYNE_AUTO_SLEEP_ENABLED`). When it does fire
+> it runs `sleep_all_sessions` (cross-session) in a daemon thread. To consolidate immediately without
+> waiting out ten turns, use the one-time backfill in [§3d](#3d-consolidation-summaries--route-them-to-your-local-vllm-not-cpu-llama-cpp).
 
 ### 3f. Where the `MNEMOSYNE_*` env vars actually go — and how to verify them
 
@@ -413,13 +431,28 @@ invariant: behavioral *settings* go in `config.yaml` (via `hermes config set`, w
 `.env`.
 
 **Why `.env` and not a drop-in — verified against source.** `gateway/run.py` calls
-`load_hermes_dotenv(...)` at **module-import time** (`run.py:1509`), and the loader applies the user
-`.env` with **`override=True`** (`hermes_cli/env_loader.py:327`). That runs **before** the Mnemosyne
+`load_hermes_dotenv(...)` at **module-import time** (top-level, not inside a function), and the loader
+applies the **user** `~/.hermes/.env` with **`override=True`**. That runs **before** the Mnemosyne
 bridge imports `mnemosyne/core/local_llm.py`, whose `LLM_BASE_URL` / `LLM_ENABLED` / `LLM_MODEL` are
-**module-level constants read once at import** (`local_llm.py:23,36,38`). So `.env` populates
-`os.environ` in time for those constants to pick up your values. A systemd `Environment=` drop-in also
-works, but `.env` is **portable across launch methods** (CLI, gateway, one-off subprocess) while a
-drop-in only applies under that exact unit — so `.env` is the canonical, single-source home.
+**module-level constants read once at import**. So `.env` populates `os.environ` in time for those
+constants to pick up your values. A systemd `Environment=` drop-in also works, but `.env` is
+**portable across launch methods** (CLI, gateway, one-off subprocess) while a drop-in only applies
+under that exact unit — so `.env` is the canonical, single-source home. Confirm the mechanism in your
+own tree by symbol (line numbers move release-to-release — on our two 0.19.0 checkouts alone
+`load_hermes_dotenv` sat ~80 lines apart):
+
+```bash
+grep -n "load_hermes_dotenv" gateway/run.py            # top-level call, before the bridge imports
+grep -n "override=True" hermes_cli/env_loader.py       # the user-.env load line
+grep -nE "^LLM_(BASE_URL|ENABLED|REMOTE_MODEL) " \
+  "$(python -c 'import mnemosyne.core.local_llm as m; print(m.__file__)')"   # import-time constants
+```
+
+> **⚠️ Use the *user* `~/.hermes/.env`, not the project `.env`.** Only the user env is loaded with
+> `override=True`. The **project** `.env` is loaded with `override=(not loaded)` and the ops env with
+> `override=False` (grep `env_loader.py` for the three `_load_dotenv_with_fallback(...)` calls). So if
+> a user `.env` already exists and you drop `MNEMOSYNE_*` into a *project* `.env` instead, its
+> `override` flips to `False` and a stale shell export can win. Put the vars in `~/.hermes/.env`.
 
 ```bash
 # ~/.hermes/.env  (direct edit is sanctioned — .env is not write-guarded; no CLI writes it.
