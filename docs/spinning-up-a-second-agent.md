@@ -602,7 +602,7 @@ python -c "import ddgs; print('ddgs', ddgs.__version__)"   # prove the import wo
 
 `web_extract` uses Firecrawl, but pointed at a **local** Firecrawl you host yourself — free, private,
 no rate-limited SaaS key. Firecrawl is considered available when **either** `FIRECRAWL_API_KEY`
-**or** `FIRECRAWL_API_URL` is set (`web_tools.py:245`), so the URL alone is enough:
+**or** `FIRECRAWL_API_URL` is set (`grep -n 'FIRECRAWL_API_URL' tools/web_tools.py` → the `_has_env(...)` check in the capability table), so the URL alone is enough:
 
 ```bash
 # Base ORIGIN only — no /v1 suffix, no key.
