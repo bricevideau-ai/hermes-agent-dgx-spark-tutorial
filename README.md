@@ -20,7 +20,7 @@ A hands-on, reproducible guide to standing up [Hermes Agent](https://github.com/
 10. [Google Integration (Gmail, Calendar, Drive, Docs)](#10-google-integration-gmail-calendar-drive-docs)
 11. [Skills & Cron](#11-skills--cron)
 12. [Reproducibility Checklist](#12-reproducibility-checklist)
-13. [Troubleshooting on ARM64](#13-troubleshooting-on-arm64)
+13. [Troubleshooting](#13-troubleshooting)
 14. [Running a Second Agent on the Same Box](#14-running-a-second-agent-on-the-same-box)
 
 ---
@@ -211,16 +211,16 @@ doesn't show as a member, ignores everyone / ignores no one). Do it in this exac
 3. On the **Bot** page, click **Reset Token**, then **Copy** — this is the value that goes in
    `~/.hermes/.env` (below). You only see it once; if you lose it, reset again.
 
-### 7.2 Enable the privileged intent (the #1 silent failure)
+### 7.2 Enable the privileged intent
 
 Still on the **Bot** page, under **Privileged Gateway Intents**, turn on **Message Content Intent**
-and click **Save Changes**.
+and click **Save Changes**. (`Presence` and `Server Members` intents are optional and off by default;
+leave them off unless a skill needs them.)
 
-> Without this the bot connects, shows green/online, and **silently ignores every message** — no error
-> anywhere. If your bot is online but deaf, this is almost always why. (`Presence` and `Server
-> Members` intents are optional and off by default; leave them off unless a skill needs them.)
+> Skipping this is the single most common Discord failure — the bot goes online but silently ignores
+> every message. If that happens, see [§13.2 Discord troubleshooting](#132-discord-gateway).
 
-### 7.3 Invite the bot **with a role** (the trap that cost us a day on the second agent)
+### 7.3 Invite the bot with a role
 
 Generate the invite under **OAuth2 → URL Generator**:
 
@@ -231,12 +231,9 @@ Generate the invite under **OAuth2 → URL Generator**:
 
 Copy the generated URL at the bottom, open it, pick your server, and **Authorize**.
 
-> **Why the permission checkboxes matter — a real failure.** When you invite a bot *with* a
-> permissions bitmask, Discord auto-creates a **managed role** for it carrying those permissions. We
-> invited our second agent with a bare `bot`-scope link and **no permissions selected**, so it landed
-> on `@everyone` only with `roles: []`. Result: `403 Missing Permissions (50013)` on every pin, and it
-> didn't render in the member sidebar. **A bot cannot grant itself a role** — the only fix is to
-> re-invite with the correct OAuth2 URL. Get the permissions right in the invite the first time.
+> **Get the permissions right in the invite the first time** — a bot cannot grant itself a role
+> afterward. If it lands with no role (can't pin, missing from the member sidebar), see
+> [§13.2 Discord troubleshooting](#132-discord-gateway).
 
 ### 7.4 Wire the token into Hermes and run
 
@@ -334,23 +331,15 @@ python -c "import sys; print(sys.executable)"   # sanity: should print a path un
 pip install "mnemosyne-memory[all]"   # engine + `mnemosyne` CLI + vector backend (sqlite-vec) + embeddings (fastembed)
 pip install mnemosyne-hermes          # the Hermes bridge (provides the mnemosyne_hermes module)
 mnemosyne-install                     # relinks the Hermes plugin symlink so Hermes sees the bridge
+systemctl --user restart hermes-gateway   # REQUIRED: the relinked plugin is invisible until restart (else start a fresh session)
 ```
 
-> **Don't drop the `[all]`.** Bare `pip install mnemosyne-memory` requires only `PyYAML`; the
-> semantic-recall dependencies (`sqlite-vec`, `fastembed`) come **only** with the `[all]` extra.
-> Confirm they landed: `python -c "import sqlite_vec, fastembed; print('vector deps OK')"`.
+> **Keep the `[all]` extra** — bare `mnemosyne-memory` ships without semantic recall, and you **must
+> restart** after `mnemosyne-install` or the plugin looks uninstalled. Both are silent traps; the
+> *why* and how to confirm are in [§13.3 Memory (Mnemosyne) troubleshooting](#133-memory-mnemosyne).
 
 > **Version note (this box, validated):** `mnemosyne-memory 3.14.0` (+ `sqlite-vec 0.1.9`,
 > `fastembed 0.8.0`) + `mnemosyne-hermes 0.5.0`.
-> `mnemosyne-install` lives inside the venv; the `mnemosyne` CLI is exposed on `~/.local/bin`.
-
-> **Restart after `mnemosyne-install` — or the change is invisible.** The relinked plugin symlink is
-> **not** picked up by an already-running process. If your gateway is up, restart it (and start a
-> fresh CLI session) *before* checking status, or `hermes memory status` will report stale state and
-> you'll think the install failed:
-> ```bash
-> systemctl --user restart hermes-gateway    # if running as a service; else just start a new session
-> ```
 
 ### 9.3 Point Hermes at Mnemosyne and make recall survive across sessions
 
@@ -640,20 +629,74 @@ Commit these (minus secrets) so another box can be brought up identically.
 
 ---
 
-## 13. Troubleshooting on ARM64
+## 13. Troubleshooting
+
+The main walkthrough (§1–§12) is the **clean deploy path** for a fresh box. This section collects the
+**known traps, silent failures, and "this bit us" war-stories** — each as *symptom → cause → proof/fix* —
+so they don't clutter the happy path. Reach for a subsection only when its symptom matches.
+
+### 13.1 Quick reference
 
 | Symptom | Fix |
 |---|---|
 | `hermes` not found after install | `source ~/.bashrc`; confirm the installer added it to `PATH` |
 | Model/provider errors | `hermes doctor`; check the API key in `~/.hermes/.env`; `hermes auth` for OAuth providers |
-| Discord bot **online but ignores messages** | Enable **Message Content Intent** (Developer Portal → Bot → Privileged Gateway Intents) — see §7.2 |
-| Discord bot **can't pin / `403 Missing Permissions (50013)`** | Bot was invited without a role; re-invite via an OAuth2 URL granting `Manage Messages` — see §7.3 |
-| Discord bot not in member sidebar | Same root cause as above — no managed role from the invite |
-| `hermes memory status` shows `Plugin: NOT installed ✗` | Install `mnemosyne-hermes` into the **Hermes venv** and run `mnemosyne-install` — see §9.2 |
-| Memory status green but recall returns nothing | Scope is `session` not `global` (§9.3), or bridge went into the wrong venv, or `MNEMOSYNE_CROSS_SESSION` missing from the live gateway env |
+| Discord bot **online but ignores messages** | Enable **Message Content Intent** — see [§13.2](#132-discord-gateway) |
+| Discord bot **can't pin / `403 Missing Permissions (50013)`** | Re-invite with a role granting `Manage Messages` — see [§13.2](#132-discord-gateway) |
+| Discord bot not in member sidebar | Same root cause — no managed role from the invite — see [§13.2](#132-discord-gateway) |
+| `hermes memory status` shows `Plugin: NOT installed ✗` | Install into the **Hermes venv** + `mnemosyne-install` + **restart** — see [§13.3](#133-memory-mnemosyne) |
+| Memory status green but recall returns nothing | Scope is `session` not `global` (§9.3), wrong venv, or missing restart — see [§13.3](#133-memory-mnemosyne) |
 | Google OAuth `Error 403: access_denied` | Add your account as a **test user** at the OAuth audience page — see §10.2 |
 | Gateway dies on SSH logout | `sudo loginctl enable-linger $USER` |
 | Gateway crash loop | `systemctl --user reset-failed hermes-gateway` |
+
+### 13.2 Discord gateway
+
+**Bot is online (green) but silently ignores every message — no error anywhere.**
+Cause: **Message Content Intent** was not enabled. When you invite a bot *with* a permissions
+bitmask, Discord relies on this privileged intent to deliver message text; without it the session
+connects and shows online but receives empty message bodies. Fix: Developer Portal → **Bot** →
+**Privileged Gateway Intents** → enable **Message Content Intent** → **Save Changes** (§7.2), then
+restart the gateway.
+*Proof it's fixed:* send the bot an allowed message and confirm it replies.
+
+**Bot can't pin (`403 Missing Permissions (50013)`) and/or doesn't render in the member sidebar.**
+Cause — *the trap that cost us a day on the second agent:* when you invite a bot with a permissions
+bitmask, Discord auto-creates a **managed role** carrying those permissions. We invited our second
+agent with a bare `bot`-scope link and **no permissions selected**, so it landed on `@everyone` only
+with `roles: []` — hence 403 on every pin and no member-sidebar entry. **A bot cannot grant itself a
+role.** Fix: re-invite via an **OAuth2 URL** with the correct **Bot Permissions** (at minimum
+`Manage Messages` for pinning) — see §7.3.
+*Proof it's fixed:* the bot now shows a non-empty `roles` array and a pin/unpin round-trips without a 403.
+
+> Provisioning a **second** bot on the same server hits extra role/permission edges — see the companion
+> doc's [§5 Discord — roles and permissions](docs/spinning-up-a-second-agent.md#5-discord--roles-and-permissions).
+
+### 13.3 Memory (Mnemosyne)
+
+**`hermes memory status` shows `Plugin: NOT installed ✗` right after a correct install.**
+Two silent causes:
+- **Missing `[all]` extra.** Bare `pip install mnemosyne-memory` pulls only `PyYAML`; the
+  semantic-recall deps (`sqlite-vec`, `fastembed`) come **only** with `mnemosyne-memory[all]` (§9.2).
+  *Proof:* `python -c "import sqlite_vec, fastembed; print('vector deps OK')"` must succeed.
+- **No restart after `mnemosyne-install`.** The relinked plugin symlink is **not** picked up by an
+  already-running process, so status reports stale "not installed" state. Fix: restart the gateway
+  (and start a fresh CLI session) *before* re-checking:
+  ```bash
+  systemctl --user restart hermes-gateway    # if running as a service; else just start a new session
+  ```
+  *(`mnemosyne-install` lives inside the venv; the `mnemosyne` CLI is exposed on `~/.local/bin`.)*
+
+**Memory status is green but recall returns nothing.** Usual culprits: scope is `session` not
+`global` (§9.3), the bridge went into the wrong venv (§9.2), or no restart after install (above). The
+full break-by-break analysis with a proof step for each is in the companion doc's
+[§3 Memory (Mnemosyne) — the three-way break](docs/spinning-up-a-second-agent.md#3-memory-mnemosyne--the-three-way-break),
+and the scope/migration overrides live in [§9.5 Memory troubleshooting](#95-memory-troubleshooting).
+
+### 13.4 Local serving & ARM64 build issues
+
+| Symptom | Fix |
+|---|---|
 | pip package builds from source (ARM64) | Ensure `build-essential` (+ `cmake`/`ninja`) are installed |
 | vLLM OOM on GB10 | Lower `--max-model-len` and `--gpu-memory-utilization`; pick a smaller/quantized model |
 | Auxiliary tasks (vision/compression) fail silently | Set `OPENROUTER_API_KEY` or `GOOGLE_API_KEY`, or configure `auxiliary.*.provider` |
