@@ -1150,11 +1150,17 @@ hermes config get skills.external_dirs
 
 The value must land as a genuine YAML **block-sequence**. The reliable, verified way to add a list
 item is a **round-trip YAML editor** (`ruamel.yaml`, which preserves formatting and comments) driven
-through `hermes config edit` — *not* a bare `hermes config set`:
+through `hermes config edit` — *not* a bare `hermes config set`. Two mechanism facts matter, and both
+bite if you skip them:
+
+- `hermes config edit` takes **no flags** — there is no `--editor`. It opens the config in whatever
+  `$EDITOR` points to, invoking it with the **config file path as `$1`**.
+- Hermes `exec`s `$EDITOR` as a **single `argv[0]`** — it does *not* shell-split it. So a multi-word
+  value like `EDITOR="python3 add-dir.py"` fails with `FileNotFoundError: 'python3 add-dir.py'`.
+  `$EDITOR` must be **one executable**. The clean way is a tiny wrapper script:
 
 ```python
-# scripts/add-external-skills-dir.py  — run via: hermes config edit --editor "python3 scripts/add-external-skills-dir.py"
-# (hermes config edit invokes the editor with the config path as its argument)
+# scripts/add-external-skills-dir.py  — the round-trip edit (reads the config path as argv[1])
 import sys
 from ruamel.yaml import YAML
 yaml = YAML()                      # round-trip mode: preserves comments + formatting
@@ -1174,16 +1180,29 @@ with open(path, "w") as f:
 ```
 
 ```bash
+# scripts/edit-config-wrapper.sh  — a single executable for $EDITOR (no shell-split needed)
+cat > scripts/edit-config-wrapper.sh <<'SH'
+#!/usr/bin/env bash
+exec python3 "$(dirname "$0")/add-external-skills-dir.py" "$1"
+SH
+chmod +x scripts/edit-config-wrapper.sh
+
+# Drive the round-trip edit through hermes config edit (NOT hermes config set):
+EDITOR="$PWD/scripts/edit-config-wrapper.sh" hermes config edit
+
 # Verify it's a LIST with a bare-string item (this read-back IS the acceptance test):
 hermes config get skills.external_dirs        # => - /var/lib/agent-shared/skills
 ```
 
-> **Why not just `hermes config set skills.external_dirs.0 <path>`?** The `.0` index does **not**
-> create a one-element list — it creates a **dict** `{0: <path>}`, which the loader silently ignores.
-> And `hermes config set skills.external_dirs '["/var/lib/agent-shared/skills"]'` stores the literal
-> **string** `["/var/lib/agent-shared/skills"]`, not a list — the loader ignores that too. There is no
-> `--append` flag. So: edit the key as a real block-sequence (above), and **never trust that it "took"
-> without reading it back** with `hermes config get` and confirming the `- ` list marker.
+> **Why not just `hermes config set`?** Every `set` form fails to author a real list here (all
+> sandbox-verified):
+> - `hermes config set skills.external_dirs.0 <path>` — the `.0` index creates a **dict** `{'0': <path>}`, which the loader silently ignores.
+> - `hermes config set skills.external_dirs '["/var/lib/agent-shared/skills"]'` — stores the literal **string** `["/var/lib/agent-shared/skills"]`, not a list.
+> - `hermes config set skills.external_dirs <path>` — stores a bare **scalar string**, not a one-element list.
+>
+> There is no `--append` flag and no `set` form that produces a YAML block-sequence — the round-trip
+> editor above is the only path. **Never trust that an edit "took" without reading it back** with
+> `hermes config get` and confirming the `- ` list marker.
 
 ### 9.2 GATE 1 — provenance: never share a Hermes/plugin-bundled skill
 
@@ -1199,18 +1218,21 @@ sources, and include a **positive control** so the check can't silently pass eve
 VENV=~/.hermes/hermes-agent/venv           # adjust to your tree
 NAME=<skill-to-vet>
 
-# 1. Bundled manifest — the authoritative sha-pinned list of core-shipped skills:
-grep -q "^$NAME " ~/.hermes/skills/.bundled_manifest && echo "BUNDLED (core) — do NOT share" || echo "not in core manifest"
+# 1. Bundled manifest — the authoritative sha-pinned list of core-shipped skills.
+#    Format is  name:sha  (colon-delimited, NOT space) — match on the colon:
+grep -q "^$NAME:" ~/.hermes/skills/.bundled_manifest && echo "BUNDLED (core) — do NOT share" || echo "not in core manifest"
 # 2. Plugin/venv package data — skills shipped inside an installed pip package:
 find "$VENV"/lib/python*/site-packages -path '*/skills/*/SKILL.md' 2>/dev/null | grep -i "$NAME" && echo "PLUGIN-shipped — do NOT share" || echo "not plugin-shipped"
 # 3. Hermes core repo tree + 4. optional-skills/ tree (if you have a checkout):
 #    grep the skill name under hermes-agent/skills/ and hermes-agent/optional-skills/
 # 5. Git first-author (in the shared repo, once promoted) should be an AGENT identity, not "Hermes Agent".
 
-# POSITIVE CONTROL: a skill you KNOW is bundled must come back BUNDLED. If your check clears a
-# known-bundled skill, the check itself is broken — fix it before trusting any "clean" verdict.
-grep -q "^mnemosyne-memory-override " ~/.hermes/skills/.bundled_manifest \
-  && echo "control: correctly flags a plugin skill? (note: memory-override is plugin, NOT in core manifest — expect ABSENT here)"
+# POSITIVE CONTROL: the check must actually FIRE on something you KNOW is bundled — otherwise a
+# check that returns "clean" for everything (e.g. wrong manifest path OR wrong delimiter) would pass
+# silently. Pick a name that IS in your manifest and confirm the grep hits it. If it does NOT print
+# "control OK", your check is broken — fix it before trusting any "clean" verdict:
+CONTROL=$(head -1 ~/.hermes/skills/.bundled_manifest | cut -d: -f1)   # a known-bundled name
+grep -q "^$CONTROL:" ~/.hermes/skills/.bundled_manifest && echo "control OK — check fires on bundled skills" || echo "CONTROL FAILED — the check itself is broken, do not trust its output"
 ```
 
 Only a skill that is **absent from all bundled sources and first-authored by an agent** is eligible
@@ -1224,16 +1246,20 @@ collision — see 9.5), and you'd only find out *after* deleting the local, when
 back to. The only proof is a **reversible load-path probe**:
 
 ```bash
-# 1. Inject a unique marker into the SHARED copy so a shared-load is unmistakable:
+# 1. Inject a unique marker into the SHARED copy so a shared-load is unmistakable. Put it on the
+#    COMMITTED shared file (so step 4's `git checkout --` can cleanly revert it):
 echo "<!-- PROV-<agent>-$(date +%s) -->" >> /var/lib/agent-shared/skills/$NAME/SKILL.md
 
-# 2. Move (don't delete) the local aside so precedence can't mask the shared copy:
-mv ~/.hermes/skills/**/$NAME ~/.hermes/_probe_stash/$NAME
+# 2. Move (don't delete) the local aside so precedence can't mask the shared copy.
+#    `**` needs globstar (OFF by default in a non-interactive shell) — enable it or give the exact path:
+shopt -s globstar
+mv ~/.hermes/skills/**/$NAME ~/.hermes/_probe_stash/$NAME    # or the exact ~/.hermes/skills/<cat>/$NAME path
 
 # 3. Load via the agent tool and confirm BOTH: it resolves to the shared dir AND returns the marker:
 #      skill_view($NAME)  ->  skill_dir == /var/lib/agent-shared/skills/$NAME   AND   marker present
-# 4. Restore the local, strip the marker from the shared copy (git checkout -- ), THEN — and only
-#    then — delete the local for real. Re-verify with NOTHING stashed: this is the real end-state.
+# 4. Restore the local, revert the marker on the shared copy (git -C /var/lib/agent-shared/skills
+#    checkout -- $NAME/SKILL.md), THEN — and only then — delete the local for real. Re-verify with
+#    NOTHING stashed: this is the real end-state.
 ```
 
 Do the probe on **both** agents' boxes, each against its own loader — a shared copy readable by one
