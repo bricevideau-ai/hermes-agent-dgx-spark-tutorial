@@ -27,6 +27,7 @@
 6. [Account & Identity Isolation](#6-account--identity-isolation)
 7. [The Five-Point Pre-Flight Checklist](#7-the-five-point-pre-flight-checklist)
 8. [Shared Memory — a cross-agent surface DB two uids can actually both write](#8-shared-memory--a-cross-agent-surface-db-two-uids-can-actually-both-write)
+9. [Shared Skills — one git-backed folder both agents load from](#9-shared-skills--one-git-backed-folder-both-agents-load-from)
 
 ---
 
@@ -1107,3 +1108,201 @@ cached), so the file test alone would have been a false green.
 | Shared DB is `-rw-rw---- :agent-shared` and survives reopen | The 0644 creation-mode trap is neutralized durably |
 | Live `-wal`/`-shm` are `0660 agent-shared` under concurrent write | umask 0002 keeps sidecars group-writable; no cross-uid lockout |
 | `mnemosyne_shared_recall` returns the other agent's row `bank:surface`, both directions, with tool `ppid == gateway pid` | The channel works through both **live providers**, not just the file |
+
+---
+
+## 9. Shared Skills — one git-backed folder both agents load from
+
+The surface DB (§8) shares *facts*. The next thing two agents want to share is *procedures* —
+**skills**. Hermes loads skills from `~/.hermes/skills/` **plus** any directory listed in
+`skills.external_dirs`, so you can point both agents at **one shared, git-backed skills folder**
+and have a skill authored by agent A load in agent B. The plumbing reuses the exact `agent-shared`
+group + setgid directory from §8.1, so if you did §8 the hard part is already done. What's new here
+is a different failure surface: **provenance, load-path precedence, and file modes** — and every one
+of them will happily let you *think* it worked while it's quietly broken. This is the verified recipe.
+
+> **Move, not copy.** The rule that keeps this sane: when a skill goes into the shared folder, it is
+> **removed** from the author's local `~/.hermes/skills/` in the same breath. A local copy left behind
+> **shadows** the shared one (local dir wins name resolution), so the two agents silently diverge — you
+> edit the shared copy and the author keeps loading their stale local. Share = relocate, not duplicate.
+
+### 9.1 The directory + config wiring
+
+Reuse the §8.1 group and setgid dir; a git repo inside it gives you history and rollback:
+
+```bash
+# As admin (or either agent, if the parent dir is already group-writable from §8.1):
+sudo install -d -m 2775 -g agent-shared /var/lib/agent-shared/skills
+cd /var/lib/agent-shared/skills && git init -q          # history + rollback for shared edits
+
+# Cross-uid git safety: the repo is owned by one uid but read/written by both. Without this,
+# git refuses to operate for the non-owner ("detected dubious ownership"). Run as EACH agent:
+git config --global --add safe.directory /var/lib/agent-shared/skills
+```
+
+Then point each agent's config at it. `skills.external_dirs` is a **YAML list**, and getting a list
+value in correctly is **the config trap that eats the most time:**
+
+```bash
+# Read the current value first — it may already exist and you want to APPEND, not overwrite:
+hermes config get skills.external_dirs
+```
+
+The value must land as a genuine YAML **block-sequence**. The reliable, verified way to add a list
+item is a **round-trip YAML editor** (`ruamel.yaml`, which preserves formatting and comments) driven
+through `hermes config edit` — *not* a bare `hermes config set`:
+
+```python
+# scripts/add-external-skills-dir.py  — run via: hermes config edit --editor "python3 scripts/add-external-skills-dir.py"
+# (hermes config edit invokes the editor with the config path as its argument)
+import sys
+from ruamel.yaml import YAML
+yaml = YAML()                      # round-trip mode: preserves comments + formatting
+path = sys.argv[1]
+NEW = "/var/lib/agent-shared/skills"
+with open(path) as f:
+    cfg = yaml.load(f)
+skills = cfg.setdefault("skills", {})
+dirs = skills.get("external_dirs")
+if not isinstance(dirs, list):     # normalize a missing/scalar value into a real list
+    dirs = [] if dirs is None else [dirs]
+    skills["external_dirs"] = dirs
+if NEW not in dirs:
+    dirs.append(NEW)
+with open(path, "w") as f:
+    yaml.dump(cfg, f)
+```
+
+```bash
+# Verify it's a LIST with a bare-string item (this read-back IS the acceptance test):
+hermes config get skills.external_dirs        # => - /var/lib/agent-shared/skills
+```
+
+> **Why not just `hermes config set skills.external_dirs.0 <path>`?** The `.0` index does **not**
+> create a one-element list — it creates a **dict** `{0: <path>}`, which the loader silently ignores.
+> And `hermes config set skills.external_dirs '["/var/lib/agent-shared/skills"]'` stores the literal
+> **string** `["/var/lib/agent-shared/skills"]`, not a list — the loader ignores that too. There is no
+> `--append` flag. So: edit the key as a real block-sequence (above), and **never trust that it "took"
+> without reading it back** with `hermes config get` and confirming the `- ` list marker.
+
+### 9.2 GATE 1 — provenance: never share a Hermes/plugin-bundled skill
+
+Before promoting a skill, prove it is **agent-authored**, not something Hermes or a plugin ships. If
+you share a bundled skill and then (per the move-not-copy rule) delete the local copy, on a box where
+the bundle *isn't* present you've just deleted the only copy — and on a box where it *is*, you now have
+a shared fork that drifts from the upstream bundle. We hit the live version of this: `mnemosyne-memory-override`
+looked like a normal local skill but is **plugin-shipped** (installed by the `mnemosyne_hermes` package),
+and deleting its local copy would have removed a guardrail with **no fallback to load**. Check five
+sources, and include a **positive control** so the check can't silently pass everything:
+
+```bash
+VENV=~/.hermes/hermes-agent/venv           # adjust to your tree
+NAME=<skill-to-vet>
+
+# 1. Bundled manifest — the authoritative sha-pinned list of core-shipped skills:
+grep -q "^$NAME " ~/.hermes/skills/.bundled_manifest && echo "BUNDLED (core) — do NOT share" || echo "not in core manifest"
+# 2. Plugin/venv package data — skills shipped inside an installed pip package:
+find "$VENV"/lib/python*/site-packages -path '*/skills/*/SKILL.md' 2>/dev/null | grep -i "$NAME" && echo "PLUGIN-shipped — do NOT share" || echo "not plugin-shipped"
+# 3. Hermes core repo tree + 4. optional-skills/ tree (if you have a checkout):
+#    grep the skill name under hermes-agent/skills/ and hermes-agent/optional-skills/
+# 5. Git first-author (in the shared repo, once promoted) should be an AGENT identity, not "Hermes Agent".
+
+# POSITIVE CONTROL: a skill you KNOW is bundled must come back BUNDLED. If your check clears a
+# known-bundled skill, the check itself is broken — fix it before trusting any "clean" verdict.
+grep -q "^mnemosyne-memory-override " ~/.hermes/skills/.bundled_manifest \
+  && echo "control: correctly flags a plugin skill? (note: memory-override is plugin, NOT in core manifest — expect ABSENT here)"
+```
+
+Only a skill that is **absent from all bundled sources and first-authored by an agent** is eligible
+to share. Plugin-owned guardrails like `mnemosyne-memory-override` **stay local on every box.**
+
+### 9.3 GATE 2 — load-path probe: prove the shared copy loads *before* deleting the local
+
+"Identical content" **never** proves "safe to delete the local." Local precedence means your loader
+could be serving the local copy while the shared one is broken (wrong path, bad perms, a name
+collision — see 9.5), and you'd only find out *after* deleting the local, when there's nothing to fall
+back to. The only proof is a **reversible load-path probe**:
+
+```bash
+# 1. Inject a unique marker into the SHARED copy so a shared-load is unmistakable:
+echo "<!-- PROV-<agent>-$(date +%s) -->" >> /var/lib/agent-shared/skills/$NAME/SKILL.md
+
+# 2. Move (don't delete) the local aside so precedence can't mask the shared copy:
+mv ~/.hermes/skills/**/$NAME ~/.hermes/_probe_stash/$NAME
+
+# 3. Load via the agent tool and confirm BOTH: it resolves to the shared dir AND returns the marker:
+#      skill_view($NAME)  ->  skill_dir == /var/lib/agent-shared/skills/$NAME   AND   marker present
+# 4. Restore the local, strip the marker from the shared copy (git checkout -- ), THEN — and only
+#    then — delete the local for real. Re-verify with NOTHING stashed: this is the real end-state.
+```
+
+Do the probe on **both** agents' boxes, each against its own loader — a shared copy readable by one
+uid can still be unreadable by the other (see 9.4).
+
+### 9.4 GATE 3 — file modes: tool-authored files land `0600`, and no passive trick fixes it
+
+The nastiest surprise. When an agent authors a file through its **tool layer** (the gateway process),
+the file lands `-rw-------` (`0600`) — because the gateway runs with a restrictive umask (`0077`),
+**not** your interactive shell's `0002`. So a skill agent A writes into the shared folder via its
+tools is **unreadable by agent B**, and B's loader silently can't see it. We chased the "elegant"
+durable fixes and **none of them work on this setup:**
+
+```bash
+# A shell `umask 0002` does NOT help — the GATEWAY writes the file, not your shell.
+# A POSIX default ACL does NOT help either — the file's 0600 mode clamps the ACL mask to ---:
+#   setfacl -d -m group:agent-shared:rw /var/lib/agent-shared/skills   # looks set...
+#   getfacl <file>  ->  group:agent-shared:rw-   #effective:---         # ...but neutered by the mask
+# (And a repo-wide ACL is structurally impossible anyway: ownership spans two uids, so each
+#  agent can only setfacl files it owns.)
+```
+
+The reliable fix is an **explicit `chmod` at hand-off**, verified from the *other* agent's uid — not a
+mount trick that silently doesn't fire:
+
+```bash
+# After authoring/promoting, the AUTHOR fixes the mode on exactly the files it owns:
+chmod 0664 /var/lib/agent-shared/skills/$NAME/SKILL.md
+find /var/lib/agent-shared/skills/$NAME -type f -exec chmod 0664 {} +
+# PROVE it from the OTHER uid (this is the real test — the author's own read tells you nothing):
+sudo -u <other-agent-uid> test -r /var/lib/agent-shared/skills/$NAME/SKILL.md && echo "readable by other agent" || echo "STILL BLOCKED"
+# Sweep for any group-unreadable file left in the repo, so it's closed, not just patched for one file:
+find /var/lib/agent-shared/skills -type f ! -perm -g=r
+```
+
+### 9.5 The staging-teardown trap — leftover merge dirs get scanned as *live skills*
+
+When two agents both authored a same-named skill, you'll stage copies (e.g. under
+`_merge-staging/<agent>/`) to diff and merge them into one shared version. **Remove that staging tree
+before you delete any local copy.** Because the staging dirs live *inside* an `external_dirs` folder,
+the loader scans them as **live skills** — so after a merge you have three copies of the name (the
+promoted root copy plus the two staging copies), and the loader throws an **ambiguous-name collision**
+that makes the skill *unloadable*. It stays invisible while a local copy still exists (local precedence
+masks it) and only detonates the moment you delete the local — exactly when you have the least fallback.
+We hit this live; the 9.3 mv-aside probe is what surfaced it before any real delete.
+
+```bash
+# Correct order:
+#   1. promote the merged skill to the repo ROOT
+#   2. git rm -r _merge-staging        # tear down staging FIRST (content is preserved in git history)
+#   3. mv-aside + GATE 2 probe the ROOT copy on BOTH boxes
+#   4. only now delete the local copies
+```
+
+### 9.6 Dual-writer hygiene — `git status` before you touch a shared tree
+
+Both agents can commit to the same repo. Before any tree-wide operation (a `chmod -R`, a bulk edit, a
+`git add -A`), run `git status` first — the *other* agent may have staged or in-flight work you'd
+clobber or accidentally commit. We had a near-miss where one agent's `chmod` pass touched files the
+other was actively probing. No harm done, but the discipline is cheap: **look before you write on
+shared state.**
+
+### What "done" actually means here
+
+| Check | Proves |
+|---|---|
+| `hermes config get skills.external_dirs` shows a `- ` list item, not a dict/string | The `external_dirs` wiring took (not the `.0`-index or JSON-string trap) |
+| Candidate skill is absent from `.bundled_manifest`, venv package data, core + optional trees; git first-author is an agent | GATE 1 — it's genuinely agent-authored, safe to share (not a plugin guardrail like `memory-override`) |
+| `skill_view` resolves to `skill_dir=/var/lib/agent-shared/...` with the local moved aside, returning the injected marker | GATE 2 — the shared copy actually loads; safe to delete the local |
+| `sudo -u <other-uid> test -r` succeeds on every shared file; `find ... ! -perm -g=r` is empty | GATE 3 — the tool-authored `0600` mode is fixed for the other agent, repo-wide |
+| No `_merge-staging` (or other nested skill dirs) left under the shared folder | The ambiguous-name collision trap is neutralized before any local delete |
+| Final no-stash `skill_view` on both boxes resolves to the shared dir with no local shadow | The real steady state: one shared source of truth, both agents loading it |
