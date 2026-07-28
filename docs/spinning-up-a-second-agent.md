@@ -230,6 +230,8 @@ hermes config get memory.mnemosyne.default_scope     # -> global   (bridge reads
 MNEMOSYNE_DEFAULT_SCOPE=global mnemosyne store "a durable fact"   # else lands scope=session
 
 # 3. OVERRIDE for LEGACY session-scoped rows already in the DB (recall-side):
+#    ONLY needed when MIGRATING a DB that has legacy scope=session rows written before you switched
+#    to default_scope=global. A FRESH install configured with default_scope=global does NOT need this.
 systemctl --user edit hermes-gateway   # add: Environment=MNEMOSYNE_CROSS_SESSION=1
 systemctl --user daemon-reload && systemctl --user restart hermes-gateway
 tr '\0' '\n' < /proc/$(pgrep -u "$USER" -f hermes-gateway | head -1)/environ | grep MNEMOSYNE
