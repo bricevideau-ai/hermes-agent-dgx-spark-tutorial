@@ -388,6 +388,12 @@ MNEMOSYNE_LLM_MAX_TOKENS=16384   # default is 2048 — far too small for a reaso
 MNEMOSYNE_LLM_TIMEOUT=300        # default is 60s — a long <think> can exceed it
 ```
 
+> **⚠️ `16384` is only reachable if your `MNEMOSYNE_LLM_BASE_URL` endpoint allows it.** The effective
+> cap is bounded by the served model's context window and, for the local vLLM path recommended here, by
+> vLLM's `--max-model-len`: it must be **≥ this value plus your prompt tokens**, or vLLM will clamp or
+> error on the request. If your endpoint's context is smaller, pick the largest value it supports (and
+> shrink the consolidation batch if needed) rather than a number the server can't honor.
+
 **Why the default (`2048`) corrupts episodic memory.** After the summarizer replies, Mnemosyne runs the
 output through `_clean_output()`, which strips the reasoning block with the regex
 `re.sub(r"<think>.*?</think>", "", …)`. That regex needs the **closing** `</think>` tag to match. A
@@ -397,6 +403,11 @@ Mnemosyne stores the **raw, unfinished reasoning fragment** as the episodic row.
 garbage that looks like the model talking to itself instead of a clean fact summary. Raising the cap to
 `16384` lets the model finish its reasoning and emit a real summary; `TIMEOUT=300` gives that longer
 generation room to complete instead of erroring out at 60s.
+
+There's a subtler second failure that points the same way: even when `<think>` *does* close, if the cap
+then truncates the **actual summary after it**, `_clean_output()` strips the reasoning block cleanly and
+stores a **clean-looking but silently truncated** fact — no garbage marker to catch it. So the cap must
+be sized for the whole *reasoning-plus-summary* length, not just enough to close the think block.
 
 This is **model-agnostic**: it bites whenever `MNEMOSYNE_LLM_BASE_URL` / `MNEMOSYNE_LLM_MODEL` point at
 *any* reasoning model — most commonly the **local vLLM at `localhost:8000`**, whatever model it happens
