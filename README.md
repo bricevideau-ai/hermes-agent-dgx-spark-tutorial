@@ -368,6 +368,54 @@ doesn't pass an explicit scope.
 > legacy `scope=session` rows — see [§9.5 Memory troubleshooting](#95-memory-troubleshooting). Don't
 > set it reflexively.
 
+#### The consolidation summarizer — size its output for a *reasoning* model, or it corrupts the episodic tier
+
+Mnemosyne's sleep/consolidation cycle compresses old working-memory rows into episodic summaries by
+calling an LLM. Which LLM is controlled by these env vars in `~/.hermes/.env`:
+
+```bash
+# In ~/.hermes/.env — the model that writes episodic summaries during consolidation:
+MNEMOSYNE_LLM_BASE_URL=http://localhost:8000/v1   # e.g. your local vLLM (§7)
+MNEMOSYNE_LLM_MODEL=<whatever that endpoint serves>
+```
+
+If that summarizer is a **reasoning model** — one that emits a `<think>…</think>` block before its
+answer — the two defaults below will silently corrupt the episodic tier, so set them explicitly:
+
+```bash
+# In ~/.hermes/.env :
+MNEMOSYNE_LLM_MAX_TOKENS=16384   # default is 2048 — far too small for a reasoning model
+MNEMOSYNE_LLM_TIMEOUT=300        # default is 60s — a long <think> can exceed it
+```
+
+**Why the default (`2048`) corrupts episodic memory.** After the summarizer replies, Mnemosyne runs the
+output through `_clean_output()`, which strips the reasoning block with the regex
+`re.sub(r"<think>.*?</think>", "", …)`. That regex needs the **closing** `</think>` tag to match. A
+reasoning model routinely spends more than 2048 tokens inside `<think>`, so a `MAX_TOKENS=2048` cap
+truncates the response *mid-`<think>`* — the closing tag never arrives, the strip matches nothing, and
+Mnemosyne stores the **raw, unfinished reasoning fragment** as the episodic row. The tier fills with
+garbage that looks like the model talking to itself instead of a clean fact summary. Raising the cap to
+`16384` lets the model finish its reasoning and emit a real summary; `TIMEOUT=300` gives that longer
+generation room to complete instead of erroring out at 60s.
+
+This is **model-agnostic**: it bites whenever `MNEMOSYNE_LLM_BASE_URL` / `MNEMOSYNE_LLM_MODEL` point at
+*any* reasoning model — most commonly the **local vLLM at `localhost:8000`**, whatever model it happens
+to serve. If your summarizer is a small non-reasoning model, the default is harmless; but since the
+local-vLLM path is the recommended low-cost consolidation backend here, treat these two lines as part
+of the standard memory setup.
+
+> **⚠️ Both vars are read at module-import time**, not per-call (in `mnemosyne/core/local_llm.py`:
+> `LLM_MAX_TOKENS = int(os.environ.get("MNEMOSYNE_LLM_MAX_TOKENS", "2048"))` and
+> `LLM_TIMEOUT = float(os.environ.get("MNEMOSYNE_LLM_TIMEOUT", "60"))` are both module-level). Editing
+> `~/.hermes/.env` does **not** update a *running* gateway — you must restart it so the new values load:
+>
+> ```bash
+> systemctl --user restart hermes-gateway   # same restart rule as §9.2
+> # prove the live process actually has them:
+> tr '\0' '\n' < /proc/$(pgrep -u "$USER" -f hermes-gateway | head -1)/environ | grep MNEMOSYNE_LLM
+> # expect: MNEMOSYNE_LLM_MAX_TOKENS=16384  and  MNEMOSYNE_LLM_TIMEOUT=300
+> ```
+
 #### Which tool stores durable facts — Mnemosyne (⚙️), not the legacy `memory` tool (🧠)
 
 Configuring the provider is only half the job: the agent has to write durable facts with the **right
