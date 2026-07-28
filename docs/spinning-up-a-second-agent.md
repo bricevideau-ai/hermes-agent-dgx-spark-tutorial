@@ -26,7 +26,7 @@
 6. [Discord — roles and permissions](#5-discord--roles-and-permissions)
 6. [Account & Identity Isolation](#6-account--identity-isolation)
 7. [The Five-Point Pre-Flight Checklist](#7-the-five-point-pre-flight-checklist)
-8. [Shared Memory — a cross-agent surface DB two uids can both write](#8-shared-memory--a-cross-agent-surface-db-two-uids-can-actually-both-write)
+8. [Shared Memory — a cross-agent surface DB two uids can actually both write](#8-shared-memory--a-cross-agent-surface-db-two-uids-can-actually-both-write)
 
 ---
 
@@ -1007,10 +1007,13 @@ issuing the command, and the in-process safety guard blocks it. This is where th
 check-and-balance earns its keep: **agent A (a separate uid/process) runs the terminate for
 agent B**, and vice-versa. Neither can self-cycle; each cycles the other.
 
-> If you script the session-cycle from *inside* an agent, its guard also pattern-matches the
-> literal gateway-restart string even when the command targets a **different** user via
-> `sudo -u`. The clean way around that (not string-gaming) is a transient unit that runs outside
-> the caller's process tree: `sudo systemd-run --unit=bounce-$(date +%s) --collect sudo -u <other> env XDG_RUNTIME_DIR=/run/user/<uid> DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/<uid>/bus systemctl --user <action> hermes-gateway.service` (fill `<action>` at runtime so the literal trigger phrase isn't in your script text).
+> **Don't try to route the cycle around the agent's own safety guard.** An agent that scripts a
+> gateway restart — even one targeting a *different* user via `sudo -u` — will (correctly) trip
+> the in-process guard that pattern-matches the restart string, because a self-directed restart
+> can kill the very process issuing it. The right answer is not to obfuscate the command so the
+> guard misses it; it's the cross-agent cycle above: the *other* agent, running as a separate
+> uid/process, issues the `loginctl terminate-user`. If you have no second agent and only an admin
+> shell, run it there. Treat the guard as a real safety boundary, not an obstacle to game.
 
 ### 8.3 The trap that looks like a hard blocker but isn't: SQLite's creation-mode 0644
 
