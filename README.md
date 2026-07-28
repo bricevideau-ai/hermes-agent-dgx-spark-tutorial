@@ -416,7 +416,7 @@ local-vLLM path is the recommended low-cost consolidation backend here, treat th
 of the standard memory setup.
 
 > **⚠️ Both vars are read at module-import time**, not per-call (in `mnemosyne/core/local_llm.py`:
-> `LLM_MAX_TOKENS = int(os.environ.get("MNEMOSYNE_LLM_MAX_TOKENS", "2048"))` and
+> `LLM_MAX_TOKENS = int(os.environ.get("MNEMOSYNE_LLM_MAX_TOKENS", "2048") or "2048")` and
 > `LLM_TIMEOUT = float(os.environ.get("MNEMOSYNE_LLM_TIMEOUT", "60"))` are both module-level). Editing
 > `~/.hermes/.env` does **not** update a *running* gateway — you must restart it so the new values load:
 >
