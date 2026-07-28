@@ -774,6 +774,11 @@ them up with symptom → root cause → fix → **verification** for each:
 
 Start with its [Five-Point Pre-Flight Checklist](docs/spinning-up-a-second-agent.md#7-the-five-point-pre-flight-checklist).
 
+Once both agents are healthy, the companion doc also covers **sharing state between them** — a
+[cross-agent surface memory DB](docs/spinning-up-a-second-agent.md#8-shared-memory--a-cross-agent-surface-db-two-uids-can-actually-both-write)
+two uids can both write, and a [shared git-backed skills folder](docs/spinning-up-a-second-agent.md#9-shared-skills--one-git-backed-folder-both-agents-load-from)
+both agents load from (with the provenance, load-path, and file-mode gates that make it safe).
+
 ---
 
 ## License
