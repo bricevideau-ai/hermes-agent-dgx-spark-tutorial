@@ -4,6 +4,12 @@ A hands-on, reproducible guide to standing up [Hermes Agent](https://github.com/
 
 > Written and validated on a real DGX Spark (`piment`): Ubuntu 24.04.4 LTS, `aarch64`, NVIDIA GB10, driver 580.173.02, CUDA 13.0, Python 3.11.15, Hermes Agent v0.19.0.
 
+**One tutorial, one agent — and more if you want them.** This is a single linear guide: follow it top to bottom to bring up an agent. Everything here applies to *every* agent you provision — there is no separate "first agent" vs "second agent" procedure, because there isn't one: the prerequisites, the install, the model wiring, the memory setup, and every trap are identical whether it's your only agent or your fourth. The handful of steps that *only* matter once you run **more than one agent on the same box** (isolating identities, sharing a slice of memory between them) are called out inline with a clear marker:
+
+> 🔀 **Multiple agents only** — skip this if you're running a single agent on the box.
+
+So: read straight through for one agent; watch for the 🔀 markers if you're adding another.
+
 ---
 
 ## Table of Contents
@@ -11,17 +17,20 @@ A hands-on, reproducible guide to standing up [Hermes Agent](https://github.com/
 1. [Why Hermes on a DGX Spark](#1-why-hermes-on-a-dgx-spark)
 2. [Prerequisites & Hardware Baseline](#2-prerequisites--hardware-baseline)
 3. [Install Hermes](#3-install-hermes)
-4. [First Run & Model Setup](#4-first-run--model-setup)
+4. [Model & Provider Wiring](#4-model--provider-wiring)
 5. [Verifying the Install (`hermes doctor`)](#5-verifying-the-install-hermes-doctor)
 6. [Wiring Up a Local LLM on the Spark](#6-wiring-up-a-local-llm-on-the-spark)
 7. [Adding the Discord Gateway](#7-adding-the-discord-gateway)
 8. [Running Hermes as a Persistent Service](#8-running-hermes-as-a-persistent-service)
 9. [Long-Term Memory (Mnemosyne)](#9-long-term-memory-mnemosyne)
-10. [Google Integration (Gmail, Calendar, Drive, Docs)](#10-google-integration-gmail-calendar-drive-docs)
-11. [Skills & Cron](#11-skills--cron)
-12. [Reproducibility Checklist](#12-reproducibility-checklist)
-13. [Troubleshooting](#13-troubleshooting)
-14. [Running a Second Agent on the Same Box](#14-running-a-second-agent-on-the-same-box)
+10. [Web Search & Extraction](#10-web-search--extraction)
+11. [Google Integration (Gmail, Calendar, Drive, Docs)](#11-google-integration-gmail-calendar-drive-docs)
+12. [Backups — an untested backup is not a backup](#12-backups--an-untested-backup-is-not-a-backup)
+13. [Skills & Cron](#13-skills--cron)
+14. [Running More Than One Agent on the Same Box](#14-running-more-than-one-agent-on-the-same-box) 🔀
+15. [Verifying a Healthy Agent](#15-verifying-a-healthy-agent)
+16. [Reproducibility Checklist](#16-reproducibility-checklist)
+17. [Troubleshooting](#17-troubleshooting)
 
 ---
 
@@ -55,6 +64,7 @@ You need:
 - **Ubuntu 24.04 LTS (ARM64)** or similar, with the NVIDIA driver already installed (the DGX Spark ships with it).
 - **Python 3.10+** (3.11 recommended; the installer provisions its own via `uv` if needed).
 - **`curl`, `git`, `build-essential`** for any packages that compile from source on ARM64.
+- **`sudo`** on the box — you need it for the base packages below, for `enable-linger` (§8), and, if you run more than one agent, for creating each agent's Linux user (§14). The sudo requirement is the same whether you run one agent or several.
 - Outbound network access for the installer and (optionally) hosted model APIs.
 
 ```bash
@@ -63,6 +73,30 @@ sudo apt-get install -y curl git build-essential
 ```
 
 > **ARM64 note:** Almost everything in the Python ecosystem now ships `aarch64` wheels, but a few packages still build from source. Having `build-essential` (and occasionally `cmake`/`ninja`) present up front saves headaches.
+
+### 2.1 Each agent is a dedicated Linux user
+
+Run **each** agent as its own Linux user, in that user's home. Even for your very first agent this keeps memory, secrets, sessions, and the gateway service cleanly isolated under one `$HERMES_HOME` (`~/.hermes`), and it means adding a second agent later is just "repeat as a new user" rather than a migration. A second agent is **never** a second profile under the first user — it's a separate user.
+
+```bash
+# As an admin, create the agent's user (repeat per agent, e.g. corwin-ai, deirdre-ai):
+sudo adduser --disabled-password --gecos "" <agent-user>
+sudo usermod -aG sudo,docker <agent-user>     # grant the same groups the box's agents use, deliberately
+sudo loginctl enable-linger <agent-user>      # so the user's gateway service survives logout (see §8)
+```
+
+Everything after this runs **as that user**, in that user's `~/.hermes`.
+
+> **Operating another user's `--user` services.** The per-user systemd bus is keyed on UID, so from a *different* login you must point at the target UID's runtime dir:
+>
+> ```bash
+> # Run a --user systemctl command for uid 1002 from a different login:
+> sudo -u <agent-user> XDG_RUNTIME_DIR=/run/user/1002 \
+>   DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1002/bus \
+>   systemctl --user restart hermes-gateway.service
+> ```
+
+> **Pitfall (real):** `sudo cmd <<'HEREDOC'` fails auth because the heredoc consumes sudo's password channel. Write the script to a temp file and run `sudo python3 /tmp/x.py` instead. With passwordless sudo configured this is moot, but don't rely on that on a fresh box.
 
 ---
 
@@ -93,7 +127,7 @@ Config and secrets live under `~/.hermes/`:
 
 ---
 
-## 4. First Run & Model Setup
+## 4. Model & Provider Wiring
 
 Pick a model/provider interactively:
 
@@ -106,19 +140,107 @@ hermes model
 Hermes is provider-agnostic. Common choices:
 
 - **Hosted API** — Anthropic, OpenAI, OpenRouter, Google, DeepSeek, xAI, etc. Set the relevant key in `~/.hermes/.env` (e.g. `OPENROUTER_API_KEY=...`).
-- **Private/OpenAI-compatible gateway** — set `model.base_url` + `model.api_key` in `config.yaml` (see §6, which uses the same mechanism for a local model).
+- **Private/OpenAI-compatible gateway** — set `model.base_url` + `model.api_key` in `config.yaml` (the same mechanism §6 uses for a local model).
 
-Quick smoke test:
+Quick smoke test, then drop into an interactive session:
 
 ```bash
 hermes chat -q "In one sentence, what are you running on?"
+hermes            # interactive
 ```
 
-Then drop into an interactive session:
+### 4.1 The silent-downgrade trap — define `custom_providers:` explicitly
+
+**Symptom.** The agent boots and answers, but is noticeably dim — shallow reasoning, misreads its own state. ("Barely conscious," in our notes.) Nothing errors.
+
+**Root cause.** A *bare* custom provider with no matching `custom_providers:` block:
+
+```yaml
+# BROKEN — what we actually shipped first
+model:
+  default: nemotron
+  provider: custom
+  base_url: http://localhost:8000/v1
+  api_key: EMPTY
+# ...and NO custom_providers: block anywhere in the file.
+```
+
+With no `custom_providers:` entry, `provider: custom` resolves straight to whatever `base_url` says — here, the **local Nemotron** on `localhost:8000`. The agent silently ran on the weak local model when we thought we'd pointed it at a frontier model. It never complained because, from the config's point of view, this is a perfectly valid setup.
+
+**Fix.** Define the provider explicitly and point `model.default` at the real model:
+
+```yaml
+model:
+  default: Claude Opus 4.8
+  provider: custom
+  base_url: https://<your-gateway>/v1
+  api_key: <your-key>
+
+custom_providers:
+  - name: Argo
+    base_url: https://<your-gateway>/v1
+    api_key: <your-key>
+    model: Claude Opus 4.8
+    models:
+      - Claude Opus 4.8
+      - Claude Sonnet 5
+      # ...whatever the gateway serves
+  - name: Local Nemotron
+    base_url: http://localhost:8000/v1
+    model: nemotron
+    api_mode: chat_completions
+    models:
+      nemotron:
+        context_length: 262144
+```
+
+**Verify — don't assume.** Make the *running* agent tell you what it's on, and cross-check against the raw endpoint:
 
 ```bash
-hermes
+# 1. Ask the live agent:
+hermes chat -q "State your exact model and provider base_url in one line."
+
+# 2. Cross-check the raw endpoint actually answers (some servers 200 with empty content):
+curl -s http://localhost:8000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"nemotron","messages":[{"role":"user","content":"say ALIVE"}]}' \
+  | python3 -m json.tool
 ```
+
+> A `200` with `content: null` is **not** "working" — a real failure we hit was a healthy `/v1/models` masking a completion path that returned nothing. Read the payload, not just the status code.
+
+### 4.2 Fallback chain — redundancy in hardware is not redundancy in config
+
+**Symptom.** Single point of failure: if the primary gateway drops, the agent dies. The local GPU is *right there* serving a model, but the agent never uses it.
+
+**Root cause.** No `fallback_providers` configured. Everything routed through one provider.
+
+**Fix.** Register the local model (§6) as a fallback. `hermes fallback add` is an **interactive picker** (no scripting flags), and it has a **"Custom endpoint (enter URL manually)"** option near the bottom — use it to point at `http://localhost:8000/v1`. Or declare it directly:
+
+```yaml
+fallback_providers:
+  - provider: custom
+    model: nemotron
+    base_url: http://localhost:8000/v1
+    api_mode: chat_completions
+```
+
+> **Design note:** a fallback to *another model on the same gateway* is worthless — when the gateway is down, both go down in the same breath. The only fallback that survives a gateway outage is one on a **different substrate**, i.e. the local GPU. (This is exactly why standing up the local LLM in §6 pays off twice: cheap inference *and* a real failover target.)
+
+**Verify — force a real failover.** A fallback in the list is a hypothesis until you watch it catch:
+
+```bash
+# In an ISOLATED copy of the config (never your live one):
+export HERMES_HOME=/tmp/hermes-failover-test
+cp -r ~/.hermes "$HERMES_HOME"
+# Break ONLY the top-level model.base_url (the primary Hermes actually uses):
+#   point it at a dead port, e.g. http://127.0.0.1:59999/v1
+# Then fire one query and watch for the switch line:
+hermes chat -q "Reply exactly: FAILOVER-WORKS"
+# Expect: "🔄 Switched to fallback model: ... → nemotron via custom"  then the answer.
+```
+
+If you `sed` the base_url, confirm you hit the **top-level** `model.base_url` and not the first `base_url` in `custom_providers` — they're different lines and only the top-level one is the primary route.
 
 ---
 
@@ -192,7 +314,7 @@ Restart your session and test:
 hermes chat -q "Say hello from the local model on the Spark."
 ```
 
-Now you can flip between local and hosted models by editing `model.provider` / `model.base_url` — the rest of your agent (skills, memory, gateway) is unaffected.
+Now you can flip between local and hosted models by editing `model.provider` / `model.base_url` — the rest of your agent (skills, memory, gateway) is unaffected. This local endpoint is also what §4.2 uses as a failover target and what §9 uses as the memory-consolidation summarizer.
 
 ---
 
@@ -218,7 +340,7 @@ and click **Save Changes**. (`Presence` and `Server Members` intents are optiona
 leave them off unless a skill needs them.)
 
 > Skipping this is the single most common Discord failure — the bot goes online but silently ignores
-> every message. If that happens, see [§13.2 Discord troubleshooting](#132-discord-gateway).
+> every message. If that happens, see [§17.2 Discord troubleshooting](#172-discord-gateway).
 
 ### 7.3 Invite the bot with a role
 
@@ -232,8 +354,12 @@ Generate the invite under **OAuth2 → URL Generator**:
 Copy the generated URL at the bottom, open it, pick your server, and **Authorize**.
 
 > **Get the permissions right in the invite the first time** — a bot cannot grant itself a role
-> afterward. If it lands with no role (can't pin, missing from the member sidebar), see
-> [§13.2 Discord troubleshooting](#132-discord-gateway).
+> afterward. When you invite a bot *with* a permissions bitmask, Discord auto-creates a **managed
+> role** carrying those permissions. Invite with a bare `bot`-scope link and **no permissions
+> selected** and it lands on `@everyone` only with `roles: []` — which means `403` on every pin and
+> no member-sidebar entry. **A bot cannot grant itself a role afterward.** (This is the trap that cost
+> us a day when we brought up a second bot — see §7.6.) If it lands with no role, re-invite via an
+> OAuth2 URL with the correct permissions; see also [§17.2](#172-discord-gateway).
 
 ### 7.4 Wire the token into Hermes and run
 
@@ -264,8 +390,44 @@ request-handling noise and does **not** prove login. Then send the bot a message
 account and confirm it replies. If you enabled `Manage Messages`, pin a throwaway message and unpin
 it to confirm the permission actually landed (a non-empty `roles` array + a successful pin, not a 403).
 
-> Provisioning a **second** bot on the same server hits extra role/permission edges — see the
-> companion doc's [§5 Discord — roles and permissions](docs/spinning-up-a-second-agent.md#5-discord--roles-and-permissions).
+### 7.6 🔀 Multiple agents only — roles and permissions for a second bot
+
+> 🔀 **Multiple agents only** — skip this if you're running a single agent on the box.
+
+Provisioning a **second** bot on the same server hits extra role/permission edges.
+
+**Symptom.** The second bot doesn't render as a server member and can't pin
+(`403 Missing Permissions` / `MANAGE_MESSAGES`).
+
+**Root cause.** The bot was invited **without a role**, so it landed in the server on `@everyone`
+only (`roles: []`). The first bot had a `managed: true` role auto-created when it was invited with the
+right OAuth scope; the second invite lacked it. No role → no `MANAGE_MESSAGES` → pin returns `403`,
+and (combined with intents) it doesn't render in the member sidebar.
+
+**Fix.** Re-invite the bot via an OAuth2 URL that grants a managed role with the needed permissions
+(admin is simplest; scope it down if you prefer). This is a human step in the Discord UI — the bot
+cannot grant itself a role.
+
+**Verify — two independent checks, both against ground truth:**
+
+```bash
+# 1. The bot's gateway actually reaches READY (discord.py's on_ready).
+#    The "Connected as <bot>#<discriminator>" line ONLY prints on on_ready — that IS READY.
+grep -E "Connected as|discord connected" ~/.hermes/logs/gateway.log | tail
+# Expect a line like:  [Discord] Connected as Deirdre#0968   then   ✓ discord connected
+# (One per restart. If this line is absent, the session is NOT logged in — a real red flag.)
+
+# 2. The role landed and the exact privileged action that 403'd now succeeds.
+#    Via the discord admin tooling: member_info → expect a non-empty "roles" array;
+#    then pin_message a throwaway message → expect success (not 403) → unpin to clean up.
+```
+
+> **Lesson (the durable part):** "the bot answers messages" and "the bot's gateway is fully logged
+> in (READY) with the right role" are **different states**. Don't infer one from the other. Make the
+> READY line and a non-empty `roles` array explicit health checks when provisioning a new bot — and
+> read the *right* log line: `Connected as …` is READY; a generic `response ready` line is unrelated
+> request-handling noise and does **not** prove login. (We initially misdiagnosed this by grepping
+> too loosely and matching `response ready`; the fix was to grep for `Connected as` specifically.)
 
 ---
 
@@ -279,7 +441,7 @@ hermes gateway start
 hermes gateway status
 ```
 
-**Critical on a headless/SSH box:** enable linger so the user service keeps running after you disconnect:
+**Critical on a headless/SSH box:** enable linger so the user service keeps running after you disconnect (you already did this in §2.1 when you created the user; re-run it if unsure):
 
 ```bash
 sudo loginctl enable-linger "$USER"
@@ -336,7 +498,7 @@ systemctl --user restart hermes-gateway   # REQUIRED: the relinked plugin is inv
 
 > **Keep the `[all]` extra** — bare `mnemosyne-memory` ships without semantic recall, and you **must
 > restart** after `mnemosyne-install` or the plugin looks uninstalled. Both are silent traps; the
-> *why* and how to confirm are in [§13.3 Memory (Mnemosyne) troubleshooting](#133-memory-mnemosyne).
+> *why* and how to confirm are in [§17.3 Memory (Mnemosyne) troubleshooting](#173-memory-mnemosyne).
 
 > **Version note (this box, validated):** `mnemosyne-memory 3.14.0` (+ `sqlite-vec 0.1.9`,
 > `fastembed 0.8.0`) + `mnemosyne-hermes 0.5.0`.
@@ -365,22 +527,36 @@ doesn't pass an explicit scope.
 > **⚠️ Fresh install: you do NOT need `MNEMOSYNE_CROSS_SESSION`.** With `default_scope global` set
 > from the start, every fact is already global and recalls cross-session on its own. The
 > `MNEMOSYNE_CROSS_SESSION=1` override is only for *migrating* a pre-existing DB that already holds
-> legacy `scope=session` rows — see [§9.5 Memory troubleshooting](#95-memory-troubleshooting). Don't
+> legacy `scope=session` rows — see [§17.3.1 Migrating a pre-existing DB](#1731-migrating-a-pre-existing-db-with-legacy-scopesession-rows). Don't
 > set it reflexively.
 
-#### The consolidation summarizer — size its output for a *reasoning* model, or it corrupts the episodic tier
+#### The consolidation summarizer — route it to your local vLLM, and size it for a reasoning model
 
 Mnemosyne's sleep/consolidation cycle compresses old working-memory rows into episodic summaries by
 calling an LLM. Which LLM is controlled by these env vars in `~/.hermes/.env`:
 
 ```bash
 # In ~/.hermes/.env — the model that writes episodic summaries during consolidation:
-MNEMOSYNE_LLM_BASE_URL=http://localhost:8000/v1   # e.g. your local vLLM (§7)
+MNEMOSYNE_LLM_ENABLED=true
+MNEMOSYNE_LLM_BASE_URL=http://localhost:8000/v1   # your local vLLM (§6) — no API key needed
 MNEMOSYNE_LLM_MODEL=<whatever that endpoint serves>
 ```
 
-If that summarizer is a **reasoning model** — one that emits a `<think>…</think>` block before its
-answer — the two defaults below will silently corrupt the episodic tier, so set them explicitly:
+**Why point it at the local vLLM.** Mnemosyne's **default** consolidation LLM is a CPU llama-cpp GGUF.
+It's slow on a box whose GPU is already serving a good model, and a reasoning GGUF emits `<think>`
+sludge the cleaner doesn't fully strip. The local vLLM you stood up in §6 is sitting right there.
+The remote-API path fires when `MNEMOSYNE_LLM_BASE_URL` is set **and** `MNEMOSYNE_LLM_ENABLED` is not
+false; `LLM_ENABLED` **defaults to `true`**, so in practice *just setting the base URL* switches
+consolidation onto vLLM. Measured A/B on our boxes: vLLM produced a faithful ~450-char summary in
+**~16 s**; the CPU GGUF took **~21 s+** and emitted `<think>` sludge with no usable output.
+
+> **⚠️ Footgun: `MNEMOSYNE_FORCE_LOCAL`.** Setting `MNEMOSYNE_FORCE_LOCAL=1` (or `true`/`yes`) forces
+> consolidation **back** to the CPU GGUF *even when the base URL is set*. If you set it "just to test
+> the local path," clear it afterward — a stray `MNEMOSYNE_FORCE_LOCAL` is a silent way to end up back
+> on the slow, `<think>`-leaking path.
+
+If the summarizer is a **reasoning model** — one that emits a `<think>…</think>` block before its
+answer — the two token/timeout defaults will silently corrupt the episodic tier, so set them explicitly:
 
 ```bash
 # In ~/.hermes/.env :
@@ -389,9 +565,9 @@ MNEMOSYNE_LLM_TIMEOUT=300        # default is 60s — a long <think> can exceed 
 ```
 
 > **⚠️ `16384` is only reachable if your `MNEMOSYNE_LLM_BASE_URL` endpoint allows it.** The effective
-> cap is bounded by the served model's context window and, for the local vLLM path recommended here, by
-> vLLM's `--max-model-len`: it must be **≥ this value plus your prompt tokens**, or vLLM will clamp or
-> error on the request. If your endpoint's context is smaller, pick the largest value it supports (and
+> cap is bounded by the served model's context window and, for the local vLLM path, by vLLM's
+> `--max-model-len`: it must be **≥ this value plus your prompt tokens**, or vLLM will clamp or error
+> on the request. If your endpoint's context is smaller, pick the largest value it supports (and
 > shrink the consolidation batch if needed) rather than a number the server can't honor.
 
 **Why the default (`2048`) corrupts episodic memory.** After the summarizer replies, Mnemosyne runs the
@@ -409,22 +585,14 @@ then truncates the **actual summary after it**, `_clean_output()` strips the rea
 stores a **clean-looking but silently truncated** fact — no garbage marker to catch it. So the cap must
 be sized for the whole *reasoning-plus-summary* length, not just enough to close the think block.
 
-This is **model-agnostic**: it bites whenever `MNEMOSYNE_LLM_BASE_URL` / `MNEMOSYNE_LLM_MODEL` point at
-*any* reasoning model — most commonly the **local vLLM at `localhost:8000`**, whatever model it happens
-to serve. If your summarizer is a small non-reasoning model, the default is harmless; but since the
-local-vLLM path is the recommended low-cost consolidation backend here, treat these two lines as part
-of the standard memory setup.
-
-> **⚠️ Both vars are read at module-import time**, not per-call (in `mnemosyne/core/local_llm.py`:
-> `LLM_MAX_TOKENS = int(os.environ.get("MNEMOSYNE_LLM_MAX_TOKENS", "2048") or "2048")` and
-> `LLM_TIMEOUT = float(os.environ.get("MNEMOSYNE_LLM_TIMEOUT", "60"))` are both module-level). Editing
-> `~/.hermes/.env` does **not** update a *running* gateway — you must restart it so the new values load:
+> **⚠️ All `MNEMOSYNE_*` vars are read at import time**, not per-call (in `mnemosyne/core/local_llm.py`,
+> `LLM_MAX_TOKENS` / `LLM_TIMEOUT` / `LLM_BASE_URL` / `LLM_ENABLED` are module-level constants read once
+> at import). Editing `~/.hermes/.env` does **not** update a *running* gateway — restart it so the new
+> values load, and verify with the clean-env probe in
+> [§17.3.4 Where the `MNEMOSYNE_*` env vars go](#1734-where-the-mnemosyne_-env-vars-go-and-how-to-verify-them):
 >
 > ```bash
 > systemctl --user restart hermes-gateway   # same restart rule as §9.2
-> # prove the live process actually has them:
-> tr '\0' '\n' < /proc/$(pgrep -u "$USER" -f hermes-gateway | head -1)/environ | grep MNEMOSYNE_LLM
-> # expect: MNEMOSYNE_LLM_MAX_TOKENS=16384  and  MNEMOSYNE_LLM_TIMEOUT=300
 > ```
 
 #### Which tool stores durable facts — Mnemosyne (⚙️), not the legacy `memory` tool (🧠)
@@ -446,7 +614,7 @@ in a fresh session no matter how `default_scope` is set.
 > **⚠️ One trap worth flagging up front:** if you seed facts from the *shell* with `mnemosyne store`,
 > it silently defaults to `scope=session` (it reads scope from an env var, not from the config key you
 > just set) — so shell-seeded facts won't recall cross-session unless you override it. This bites fresh
-> readers; the fix is in [§9.5 Memory troubleshooting](#95-memory-troubleshooting).
+> readers; the fix is in [§17.3.2 Seeding facts from the shell](#1732-seeding-facts-from-the-shell--mnemosyne-store-defaults-to-scopesession).
 
 ### 9.4 Verify the whole chain — prove recall, don't trust the status line
 
@@ -485,109 +653,246 @@ recall it, ask it in a session: `hermes chat -q "Recall the $CANARY fact."` — 
 gateway doesn't, that's the cross-session/env-var boundary from §9.3, not a broken store.
 
 If `hermes memory status` is green but recall returns nothing, the usual culprits are: the bridge
-went into the wrong venv (§9.2), no restart after install (§9.2), or `MNEMOSYNE_CROSS_SESSION` isn't
-in the *live gateway process* env (§9.5). The companion doc walks each independent break with a proof
-step: [§3 Memory (Mnemosyne) — the three-way break](docs/spinning-up-a-second-agent.md#3-memory-mnemosyne--the-three-way-break).
+went into the wrong venv (§9.2), no restart after install (§9.2), or a scope/migration issue — the
+full break-by-break analysis with a proof step for each is in
+[§17.3 Memory (Mnemosyne) troubleshooting](#173-memory-mnemosyne).
 
-### 9.5 Memory troubleshooting
+### 9.5 Auto-sleep fires only every 10th turn — the gate that looks like a broken install
 
-Everything in §9.3–§9.4 is the clean, correct deploy path for a **fresh install**. The items below are
-**workarounds and known upstream traps** — you should not need them on a fresh, correctly-configured
-box. They're collected here so they don't clutter the happy path. Reach for them only when a specific
-symptom below matches. The companion doc has the full break-by-break analysis:
-[§3 Memory (Mnemosyne) — the three-way break](docs/spinning-up-a-second-agent.md#3-memory-mnemosyne--the-three-way-break).
+A freshly-restarted, *correctly-wired* gateway shows `episodic: 0` even though `working > 50`. It looks
+like consolidation is broken. It isn't — consolidation is built in (no cron needed), but the auto-sleep
+trigger is gated on a **per-session turn counter** that lives in the Mnemosyne↔Hermes bridge:
 
-**Recall behavior by stored scope** (proven with a fresh DB and real `BeamMemory` store→recall across
-two session IDs) — the reason `scope=global` is what you want:
-
-| Stored scope | no env var | `MNEMOSYNE_CROSS_SESSION=1` |
-|---|---|---|
-| `scope=global`  | ✅ recalled cross-session | ✅ recalled |
-| `scope=session` | ❌ not recalled            | ✅ recalled |
-
-#### 9.5.1 Migrating a pre-existing DB with legacy `scope=session` rows — `MNEMOSYNE_CROSS_SESSION=1`
-
-**When you need this:** *only* if you switched to `default_scope=global` **after** already storing
-facts at the default `scope=session` (i.e. you're migrating an existing DB). On a **fresh install**
-configured with `default_scope=global` from the start, **you do not need this** — every new fact is
-already global. Do not set it reflexively.
-
-`MNEMOSYNE_CROSS_SESSION=1` drops session filtering entirely (the recall filter becomes `(1=1)`), so it
-*additionally* exposes any `session`-scoped rows written before the switch. Set it via a **systemd
-drop-in** so it survives `hermes gateway install` regenerating the unit (editing the main unit directly
-gets clobbered):
-
-```bash
-mkdir -p ~/.config/systemd/user/hermes-gateway.service.d
-cat > ~/.config/systemd/user/hermes-gateway.service.d/10-mnemosyne-cross-session.conf <<'EOF'
-[Service]
-Environment="MNEMOSYNE_CROSS_SESSION=1"
-EOF
-systemctl --user daemon-reload && systemctl --user restart hermes-gateway   # same restart rule as 9.2
-
-# Prove it landed in the LIVE process, not just the unit file:
-tr '\0' '\n' < /proc/$(pgrep -u "$USER" -f hermes-gateway | head -1)/environ | grep MNEMOSYNE
-# expect: MNEMOSYNE_CROSS_SESSION=1
+```python
+# mnemosyne_hermes/__init__.py — the gate (symbol-anchored; line numbers drift between releases):
+self._turn_count = 0                                  # in __init__ — resets every restart
+...
+self._turn_count += 1                                 # every turn
+if self._auto_sleep_enabled and self._turn_count % 10 == 0:
+    self._maybe_auto_sleep()                          # threshold only CHECKED on turns 10, 20, 30…
 ```
 
-> **⚠️ Known bug: the `cross_session` *config key* is a no-op for recall — it's env-var-only.**
-> (Re-verified on Mnemosyne **v3.14.0**.) `cross_session` appears in Mnemosyne's config map with a
-> documented `config.yaml > env vars` precedence, so it *looks* like `cross_session: true` in
-> `config.yaml` should work. It does **not**: the recall path reads the toggle straight from the
-> process environment at import time (`beam.py`: `_cross_session_enabled()` reads only
-> `os.environ["MNEMOSYNE_CROSS_SESSION"]`) and never consults the config resolver. Verified on this
-> box: with `cross_session: true` in config, `config.get("cross_session")` returns `True` while the
-> recall gate `_cross_session_enabled()` still returns `False`. **So the *override* only works via the
-> env var.** (Reported upstream.) The `default_scope: global` mechanism in §9.3 is unaffected by this
-> bug — it goes through the normal SQL filter, not the toggle.
+So:
 
-#### 9.5.2 Seeding facts from the shell — `mnemosyne store` defaults to `scope=session`
+- Auto-sleep **only even checks** the threshold on every **10th turn** of a live session.
+- `turn_count` is **per-session** and **resets to 0 on every gateway restart**.
+- Therefore a freshly-restarted gateway with `< 10` turns will show `episodic: 0` even with
+  `working > 50`. **That is the turn gate, not a wiring bug.**
 
-If you seed memories from the shell with `mnemosyne store`, its default scope is read **only** from the
-`MNEMOSYNE_DEFAULT_SCOPE` environment variable — it ignores *both* config files (including the
-`hermes config` key from §9.3) and falls back to `session`. To store globally from the CLI:
+There's a second, quieter no-op: even on a turn that *is* a multiple of 10 with `working > threshold`,
+`_maybe_auto_sleep()` returns without logging if the eligibility check finds **zero** rows old enough
+(cutoff = `now − TTL/2`) — i.e. everything old is already consolidated.
+
+**Confirm it's the gate, not a config break.** Grep the gateway journal for the auto-sleep log line —
+its presence proves the trigger fired; its absence means `< 10` turns since restart or nothing
+eligible, not a broken config:
 
 ```bash
-MNEMOSYNE_DEFAULT_SCOPE=global mnemosyne store "a durable fact"   # else it lands scope=session
+journalctl --user -u hermes-gateway | grep "Mnemosyne auto-sleep:"
+# A hit looks like:  Mnemosyne auto-sleep: working=63, eligible=41 > threshold=50
 ```
 
-> **⚠️ Upstream bug (re-verified on Mnemosyne v3.14.0):** `mnemosyne config set default_scope global`
-> writes Mnemosyne's own `~/.hermes/mnemosyne/config.yaml`, and `mnemosyne config get` reads it back
-> (so it *looks* applied), but `store` bypasses the config resolver entirely — `cli.py`'s `cmd_store`
-> → `_resolve_default_scope()` reads only the `MNEMOSYNE_DEFAULT_SCOPE` env var. So
-> `mnemosyne config set default_scope global` is effectively a **no-op** for what scope actually gets
-> stored. Note the agent bridge does *not* use this file either; it reads `memory.mnemosyne.default_scope`
-> from *Hermes* config (§9.3). Reported upstream.
+> **Defaults & knobs (verified — grep, don't trust a line number):** the threshold is `working > 50`
+> (config key `sleep_threshold`); auto-sleep is on by default (config key `auto_sleep` / legacy
+> `MNEMOSYNE_AUTO_SLEEP_ENABLED`). When it does fire it runs `sleep_all_sessions` (cross-session) in a
+> daemon thread.
 
-#### 9.5.3 False negative: a hand-built provider in a REPL always reports `scope=session`
+**To consolidate a backlog right now** (bypass the turn gate), run a fresh subprocess with the env vars
+set — a fresh process gets a fresh reflect budget and doesn't need the live turn counter:
 
-**Symptom:** you spin up a `MnemosyneMemoryProvider()` in a Python REPL to "check" the scope, and it
-reports `session` even though `memory.mnemosyne.default_scope` is correctly `global` — making a
-correctly-configured system *look broken*.
+```bash
+# From the agent's Hermes venv, with the MNEMOSYNE_LLM_* vars exported:
+python - <<'PY'
+from mnemosyne.core import memory as M
+M.sleep_all_sessions(dry_run=False, force=True)   # force=True ignores the age cutoff
+PY
+```
 
-**Root cause (a harness gap, not a bug):** the provider learns where Hermes' config lives *only* from a
-`hermes_home` kwarg passed at init (`self._hermes_home = kwargs.get("hermes_home", "")` — there is
-**no** fallback to `HERMES_HOME` or `get_hermes_home()`). A hand-rolled `MnemosyneMemoryProvider()`
-gets `_hermes_home=""`, `read_hermes_config_key("", …)` returns `None`, and the default scope silently
-stays `session`. We reproduced exactly this false negative.
+> `force=True` consolidates all unconsolidated working rows regardless of age; `sleep_all_sessions`
+> (vs `sleep`) walks **every** session, not just the current one. Over a dozen sessions with a
+> 30B-class reasoning model this can exceed a few minutes; run it in the background rather than a
+> short foreground timeout.
 
-**Fix — validate through the live agent, not a hand-built provider.** Use the §9.4 step #4 proof: have
-the agent store a fact via the gateway, then read the row's scope back from the DB and expect
-`scope=global`.
+**Verify the remote path actually ran** — don't infer it from timing:
 
-See also the companion doc's
-[§3b](docs/spinning-up-a-second-agent.md#3b-cross-session-scoping--recall-returns-0-in-live-sessions)
-and [§3c](docs/spinning-up-a-second-agent.md#3c-cli-store-scope-and-how-to-actually-prove-a-round-trip).
+```bash
+# During a consolidation run, confirm an ESTABLISHED socket to the vLLM port:
+ss -tnp | grep :8000
+# And spot-check a fresh episodic summary is clean prose, NOT <think>...:
+sqlite3 ~/.hermes/mnemosyne/data/mnemosyne.db \
+  "SELECT substr(content,1,120) FROM episodic_memory ORDER BY rowid DESC LIMIT 1;"
+```
+
+> An `hf_hub_download` / "unauthenticated HF Hub" warning during the run is **noise**, not proof the
+> local GGUF was used — Mnemosyne lazily probes the local tokenizer to size chunks even when the
+> remote path handles the actual summary. Confirm the remote path by the live socket to vLLM and clean
+> summary text, not by the absence of that warning.
 
 ---
 
-## 10. Google Integration (Gmail, Calendar, Drive, Docs)
+## 10. Web Search & Extraction
+
+Give the agent eyes on the internet **without a paid search API key** (no Tavily/Exa/Brave/Parallel).
+Hermes splits web capability into two independent axes, each with its own backend selector, and picks a
+backend by *availability*, not by a key you bought:
+
+- `web.backend` — the shared default for both capabilities.
+- `web.search_backend` — override for `web_search` only. **If empty, it falls back to `web.backend`.**
+- `web.extract_backend` — override for `web_extract` only. Same fallback rule.
+
+The fallback is literal (`tools/web_tools.py`, `_get_capability_backend()`):
+
+```python
+specific = (cfg.get(f"{capability}_backend") or "").lower().strip()
+if specific and _is_backend_available(specific):
+    return specific
+return _get_backend()          # falls back to web.backend
+```
+
+**The sensible, zero-paid-key split** (this is what both our agents run):
+
+```bash
+hermes config set web.backend ddgs                 # search via DuckDuckGo
+hermes config set web.extract_backend firecrawl    # extract via self-hosted Firecrawl
+hermes config set web.search_backend ""            # empty → inherits web.backend (ddgs)
+```
+
+```yaml
+# ~/.hermes/config.yaml
+web:
+  backend: ddgs
+  search_backend: ''        # empty on purpose — inherits web.backend
+  extract_backend: firecrawl
+```
+
+### 10.1 `ddgs` is a PYTHON PACKAGE, not an API
+
+There is **no key and no endpoint** for DuckDuckGo search. `ddgs` is a pip package that scrapes DDG;
+Hermes treats the backend as available **iff `import ddgs` succeeds** — nothing else. (It's the *only*
+backend whose availability is a package-import probe rather than an env-var/key check.) The entire
+"setup" is:
+
+```bash
+# inside the agent's Hermes venv
+pip install ddgs
+python -c "import ddgs; print('ddgs', ddgs.__version__)"   # prove the import works
+```
+
+> Do **not** mistake DuckDuckGo for a "free API endpoint" — there isn't one. If `import ddgs` fails,
+> Hermes silently treats the backend as unavailable and search falls through to whatever else is
+> configured (often nothing).
+
+### 10.2 Firecrawl extract points at a self-hosted instance, no key
+
+`web_extract` uses Firecrawl pointed at a **local** Firecrawl you host yourself — free, private, no
+rate-limited SaaS key. Firecrawl is available when **either** `FIRECRAWL_API_KEY` **or**
+`FIRECRAWL_API_URL` is set, so the URL alone is enough:
+
+```bash
+# Base ORIGIN only — no /v1 suffix, no key.
+echo 'FIRECRAWL_API_URL=http://localhost:3002' >> ~/.hermes/.env
+```
+
+> **Two footguns:** (1) use the bare origin `http://localhost:3002` — **not** `.../v1`; Hermes appends
+> the path itself, and a `/v1` suffix double-paths the request. (2) `FIRECRAWL_API_URL` is a genuine
+> credential-adjacent endpoint, so it lives in `~/.hermes/.env`, not `config.yaml`.
+
+### 10.3 Hosting the local Firecrawl container stack
+
+> 🔀 **On a multi-agent box, host it once.** Only **one** agent runs the Firecrawl stack; every other
+> agent on the box just points `FIRECRAWL_API_URL` at the existing one — **no clone, no second stack.**
+> On our box the stack runs once under the first agent's user
+> (`/home/videau-ai/services/firecrawl/`, port `:3002`) and the second agent consumes it purely as a
+> **client**. Running the recipe below on a second agent would spin up a redundant 5-container stack or
+> collide on `:3002`. The steps below are for the **one** agent that hosts it (or a single-agent box).
+
+Self-hosted Firecrawl is a small **multi-container** stack (not a single image): the API plus Redis,
+RabbitMQ, a Postgres (`nuq-postgres`), and a Playwright browser service. On ARM64 (DGX Spark / GB10)
+**don't build from source** — use the published `arm64` images via a compose override.
+
+```bash
+# 1. Clone the repo somewhere stable (we keep services under ~/services)
+mkdir -p ~/services && cd ~/services
+git clone https://github.com/firecrawl/firecrawl.git
+cd firecrawl
+
+# 2. Env: copy the example and keep it minimal for self-host
+cp apps/api/.env.example .env    # self-host defaults are fine; USE_DB_AUTHENTICATION=false
+```
+
+Add an override so Docker pulls prebuilt arm64 images instead of compiling (this is exactly the file
+we run on `piment`):
+
+```yaml
+# ~/services/firecrawl/docker-compose.override.yaml
+# Override: use published arm64 images instead of building from source.
+name: firecrawl
+services:
+  api:
+    build: !reset null
+    image: ghcr.io/firecrawl/firecrawl:latest
+  playwright-service:
+    build: !reset null
+    image: ghcr.io/firecrawl/playwright-service:latest
+  nuq-postgres:
+    build: !reset null
+    image: ghcr.io/firecrawl/nuq-postgres:latest
+```
+
+```bash
+# 3. Bring the stack up detached; it publishes the API on :3002
+docker compose up -d
+
+# 4. Confirm all five containers are Up
+docker compose ps
+# Expect: firecrawl-api-1, firecrawl-redis-1, firecrawl-rabbitmq-1,
+#         firecrawl-nuq-postgres-1, firecrawl-playwright-service-1  — all "Up"
+```
+
+> The API container binds `0.0.0.0:3002->3002` via `docker-proxy`, which is why
+> `FIRECRAWL_API_URL=http://localhost:3002` works from the host even though the agent runs outside the
+> compose network. If you firewall the box, `:3002` should stay host-local — it's an unauthenticated
+> endpoint by design in the self-host config.
+
+**Verify — the container answers before you blame Hermes:**
+
+```bash
+curl -s http://localhost:3002/ ; echo
+# Expect: {"message":"Firecrawl API","documentation_url":"https://docs.firecrawl.dev"}
+```
+
+> **Scope caveat (honesty note).** The *running* stack, the override file, and the `:3002` health check
+> above are verified against ground truth on `piment`. The from-scratch cold-start — `git clone` +
+> `cp apps/api/.env.example .env` + first `docker compose up -d` on a genuinely **fresh** box — is
+> **not** independently clean-room tested here; both our agents verified against an already-running
+> stack. Treat the clone/env steps as the documented-but-unproven path and expect to read Firecrawl's
+> own self-host docs if a fresh bring-up hiccups.
+
+### 10.4 Prove BOTH capabilities end-to-end
+
+A configured backend is a hypothesis until a live query returns real content:
+
+```bash
+# Search (ddgs): must return live, real URLs — not an "no backend available" error.
+hermes chat -q "Use web_search for 'NVIDIA DGX Spark GB10 specifications' and list 3 result URLs."
+
+# Extract (self-hosted firecrawl): must return page text with no error.
+hermes chat -q "Use web_extract on https://example.com and quote the first sentence."
+```
+
+Both must come back with genuine content. `ddgs` (package, no key) + self-hosted Firecrawl
+(`FIRECRAWL_API_URL`, no key) gives the agent full web eyes for **$0** and keeps every fetch private to
+the box.
+
+---
+
+## 11. Google Integration (Gmail, Calendar, Drive, Docs)
 
 Hermes talks to Google Workspace through the bundled **`google-workspace`** skill, which manages
 OAuth for you. There are **two paths** — pick by what you actually need, because they have very
 different setup costs.
 
-### 10.1 Decide: App Password (email only) vs. OAuth (full Workspace)
+### 11.1 Decide: App Password (email only) vs. OAuth (full Workspace)
 
 - **Just email?** Skip Google Cloud entirely. Use the **`himalaya`** skill with a Gmail **App
   Password** (Google Account → **Security → 2-Step Verification → App passwords**). Two minutes, no
@@ -595,12 +900,10 @@ different setup costs.
 - **Calendar / Drive / Sheets / Docs (or email + those)?** Use the `google-workspace` skill with
   OAuth, below.
 
-> **On this box:** email is handled via `himalaya` + an App Password; the OAuth `google-workspace`
-> path is what you'd add for Drive/Calendar. Don't reuse one agent's Google token for another agent —
-> each agent gets its own credentials (see the companion doc's
-> [§6 Account & Identity Isolation](docs/spinning-up-a-second-agent.md#6-account--identity-isolation)).
+> **Per-agent credentials.** Each agent gets its **own** Google account and token — never reuse one
+> agent's Google token for another (see [§14.1 Account & Identity Isolation](#141-account--identity-isolation)).
 
-### 10.2 One-time: create an OAuth client in Google Cloud (~5 min)
+### 11.2 One-time: create an OAuth client in Google Cloud (~5 min)
 
 1. Create/select a project: <https://console.cloud.google.com/projectselector2/home/dashboard>
 2. Enable the APIs you need from the **API Library**
@@ -611,7 +914,7 @@ different setup costs.
    <https://console.cloud.google.com/auth/audience> — otherwise you'll get `Error 403: access_denied`.
 5. **Download the client-secret JSON** and note its path.
 
-### 10.3 Authorize (works fully headless — no browser on the box)
+### 11.3 Authorize (works fully headless — no browser on the box)
 
 The skill drives OAuth step-by-step so it works over SSH/Discord/Telegram with no local browser:
 
@@ -634,7 +937,7 @@ Calendar, Drive). If you want true least-privilege, edit that `SCOPES` list befo
 than passing a flag. The token lands at `~/.hermes/google_token.json` and **auto-refreshes** from
 then on. To revoke: `$GSETUP --revoke`.
 
-### 10.4 Use it
+### 11.4 Use it
 
 ```bash
 GAPI="python ~/.hermes/skills/productivity/google-workspace/scripts/google_api.py"
@@ -644,14 +947,71 @@ $GAPI drive upload /path/to/report.pdf
 ```
 
 > **Off-box backups to Drive** use a *different* mechanism — `rclone` with least-privilege
-> `drive.file` scope and its own headless-authorize flow — covered in the companion doc's
-> [§4 Backups](docs/spinning-up-a-second-agent.md#4-backups--an-untested-backup-is-not-a-backup).
+> `drive.file` scope and its own headless-authorize flow — covered in [§12 Backups](#12-backups--an-untested-backup-is-not-a-backup).
 > Don't conflate the `google-workspace` OAuth token (LLM/skill actions) with the rclone remote (bulk
 > file sync); they are separate credentials with separate scopes on purpose.
 
 ---
 
-## 11. Skills & Cron
+## 12. Backups — an untested backup is not a backup
+
+**Symptom.** "We have backups" — but there was no cron, and the off-box push silently did nothing
+(`rclone remote 'gdrive' not configured`, rc=2). A local script that runs once by hand is not a
+backup strategy.
+
+**Root cause.** Three gaps: (1) no schedule, (2) no off-box copy, (3) never restore-tested.
+
+**Fix — the full pipeline.**
+
+1. **Encrypt locally.** `tar | zstd | gpg --symmetric` (AES-256), passphrase from a `chmod 600`
+   file. Capture SQLite DBs with the online `.backup` API, not `cp`, so they're consistent.
+2. **Push off-box** to the agent's **own** cloud account (see [§14.1](#141-account--identity-isolation) —
+   on a multi-agent box, do **not** reuse another agent's OAuth token). Use least-privilege scope
+   (`drive.file` for Google Drive — the app only ever sees files it created).
+3. **Schedule** it (nightly cron).
+4. **Pin the passphrase off-box** (e.g. a Discord control channel). The ciphertext lives on Drive;
+   the key must live somewhere the box's loss can't take with it — otherwise you have ciphertext and
+   no key after a reimage.
+
+**Headless OAuth handoff (no browser on either box).** Our boxes are headless over Tailscale with no
+X-forwarding. `rclone authorize` is built for exactly this — run it on a machine that *has* a
+browser, then paste the token back:
+
+```bash
+# On a laptop with a browser and rclone installed:
+rclone authorize "drive" "<CLIENT_ID>" "<CLIENT_SECRET>" --auth-no-open-browser
+# It prints a URL; complete OAuth; it prints a token JSON. Paste that into:
+rclone config create gdrive drive scope=drive.file token='<TOKEN_JSON>' \
+  client_id=<CLIENT_ID> client_secret=<CLIENT_SECRET>
+```
+
+> **rclone v1.74 gotchas (confirmed):** the old JSON-blob form of `authorize` errors with
+> `illegal base64 data`, and `--scope` is rejected as an unknown flag. Use the positional
+> `authorize "drive" "<id>" "<secret>"` form above. The loopback callback listens on
+> `127.0.0.1:53682` on the box; if you're driving it from a remote laptop, SSH-tunnel it:
+> `ssh -N -L 53682:localhost:53682 user@box`.
+
+**Verify — restore from the OFF-BOX copy, not local disk.** This is the only test that proves
+disaster recovery:
+
+```bash
+# Pull the newest archive FROM the cloud (simulating a wiped box):
+rclone copy gdrive:<agent>-backups/<newest>.tar.zst.gpg /tmp/restore/
+# Decrypt + decompress + extract with the pinned passphrase:
+gpg --batch --pinentry-mode loopback \
+  --passphrase "$(cat ~/.hermes/.backup-passphrase)" \
+  -d /tmp/restore/<newest>.tar.zst.gpg | zstd -dq | tar -xf - -C /tmp/restore/
+# Prove the critical DB survived:
+sqlite3 /tmp/restore/hermes-home/mnemosyne/data/mnemosyne.db 'PRAGMA integrity_check;'  # expect: ok
+```
+
+Also keep a **negative test**: the wrapper must **fail loud** when the off-box remote is missing
+(rc≠0, visible error) rather than silently "succeeding." A backup that lies about success is worse
+than none.
+
+---
+
+## 13. Skills & Cron
 
 Beyond memory, two more things make Hermes durable:
 
@@ -673,7 +1033,517 @@ reproducible and comparable across DGX Spark boxes.
 
 ---
 
-## 12. Reproducibility Checklist
+## 14. Running More Than One Agent on the Same Box
+
+> 🔀 **Multiple agents only** — the entire section is for the case where you run **two or more** agents
+> on one box. A single agent needs none of it. Everything before this point already produced a complete,
+> working agent; you provisioned it as its own Linux user (§2.1), so adding another is mostly "repeat
+> §2–§13 as a new user," plus the cross-agent concerns below: keeping their identities isolated,
+> and (optionally) letting them share a slice of memory and a folder of skills.
+
+Provisioning a second agent is the **same tutorial again** under a new Linux user. Create the user
+exactly as in [§2.1](#21-each-agent-is-a-dedicated-linux-user), then walk §3–§13 as that user. The
+only genuinely new material is isolation (§14.1), shared memory (§14.2), and shared skills (§14.3).
+
+### 14.1 Account & Identity Isolation
+
+Each agent gets its **own** external identities. Do not share tokens between agents — a shared OAuth
+refresh token means one compromised agent exposes the other's cloud storage.
+
+| Resource            | First agent (Corwin)          | Second agent (Deirdre)         |
+|---------------------|-------------------------------|--------------------------------|
+| Linux user / UID    | `videau-ai`                   | `deirdre-ai` (1002)            |
+| `$HERMES_HOME`      | `/home/videau-ai/.hermes`     | `/home/deirdre-ai/.hermes`     |
+| Gmail               | `brice.ai.videau@gmail.com`   | `brice.ai2.videau@gmail.com`   |
+| GitHub              | `bricevideau-ai`              | `bricevideau-ai2`              |
+| Mnemosyne DB        | own `mnemosyne.db`            | own `mnemosyne.db`             |
+| Discord bot         | own token + managed role      | own token + managed role       |
+| Cloud backup remote | own rclone token/scope        | own rclone token/scope         |
+
+Naming convention that scaled cleanly for us: the second agent's online accounts mirror the first
+with a `2` suffix.
+
+**Verify isolation.** Confirm the two agents don't share a backup key or a Drive:
+
+```bash
+sha256sum ~/.hermes/.backup-passphrase   # compare across agents — hashes MUST differ
+rclone about gdrive:                      # a fresh 2nd account shows ~0 B used, not the 1st's data
+```
+
+### 14.2 Shared Memory — a cross-agent surface DB two uids can both write
+
+Two agents on one box eventually want a **shared** slice of memory: a place where agent A writes a
+fact and agent B can recall it. Mnemosyne has a built-in channel for exactly this — the **surface
+bank** (`mnemosyne_shared_remember` / `mnemosyne_shared_recall`) — and you can point both agents'
+surface banks at **one SQLite file** owned by a shared group. It works, but four separate traps sit
+between "seems configured" and "actually works." We hit all four; this is the verified recipe.
+
+> **Scope, first.** The surface bank is for *compact cross-agent metadata* — stable facts,
+> preferences, provisioning summaries. It is **not** full memory sharing: each agent's private bank
+> (`mnemosyne_remember`) stays per-agent. Don't set this up expecting agent B to see agent A's whole
+> memory; that's not what the surface bank is.
+
+#### 14.2.1 The group + directory (setgid is mandatory)
+
+```bash
+# As admin. One group both agent users belong to:
+sudo groupadd agent-shared                       # gid lands at e.g. 1003
+sudo usermod -aG agent-shared videau-ai          # agent A (uid 1001)
+sudo usermod -aG agent-shared deirdre-ai         # agent B (uid 1002)
+
+# A directory the group owns, with the SETGID bit so new files inherit the group:
+sudo install -d -m 2775 -g agent-shared /var/lib/agent-shared
+# Verify: the 's' in drwxrwsr-x is the setgid bit — without it, files land in the
+# creator's PRIMARY group and the other agent is locked out.
+stat -c '%A %U:%G' /var/lib/agent-shared     # => drwxrwsr-x root:agent-shared
+```
+
+#### 14.2.2 The trap that wastes an hour: `usermod` needs a *user-manager* cycle, not a service restart
+
+After `usermod -aG`, the new group is **not** live in the running agent. The obvious fix — restart the
+gateway service — **does not work**:
+
+```bash
+# WRONG — this does NOT pick up the new group:
+systemctl --user restart hermes-gateway.service
+# Check the PROCESS, not `id` (id reads the group DB and lies about the running process):
+grep '^Groups:' /proc/<gateway-pid>/status     # still MISSING 1003
+```
+
+Why: the **`systemd --user` manager** caches its supplementary groups at spawn and passes *its* set to
+every child it launches. It predates your `usermod`, so it hands the stale set to the freshly-restarted
+gateway. Even `daemon-reexec` preserves the cached set. The only fix is to cycle the **user manager
+itself**:
+
+```bash
+# As admin — kills the user's whole session; linger respawns the manager from PID 1
+# with freshly-computed credentials, and the gateway auto-starts (if the unit is enabled):
+sudo loginctl terminate-user deirdre-ai
+# (or: sudo systemctl restart user@1002.service)
+
+# Caveat we hit: terminate can briefly clear the lingering state, so the manager may not
+# auto-respawn in the first ~10-15s. If it doesn't come back, nudge it:
+sudo loginctl enable-linger deirdre-ai
+sudo systemctl start user@1002.service
+
+# VERIFY at the process level (not `id`), and functionally:
+grep '^Groups:' /proc/<new-gateway-pid>/status         # => now includes 1003
+sudo -u deirdre-ai touch /var/lib/agent-shared/.probe   # => succeeds; file is group agent-shared
+```
+
+> **An agent cannot do this to itself** — terminating its own session kills the very process issuing
+> the command, and the in-process safety guard blocks it (even a `sudo -u` targeting a different user
+> trips the guard, which pattern-matches the restart string). This is where two agents earn their
+> keep: **agent A (a separate uid/process) runs the terminate for agent B**, and vice-versa. If you
+> have no second agent yet and only an admin shell, run it there. Treat the guard as a real safety
+> boundary, not an obstacle to game.
+
+#### 14.2.3 The trap that looks like a hard blocker but isn't: SQLite's creation-mode 0644
+
+Point both agents' config at the shared file:
+
+```bash
+# NEVER hand-edit config.yaml — `hermes config set` authors the nested path correctly:
+hermes config set memory.mnemosyne.shared_surface_path /var/lib/agent-shared/mnemosyne.db
+hermes config set memory.mnemosyne.shared_surface_read true
+```
+
+> `hermes config set` prints a **"not a recognized config key"** warning for these two — it's a
+> **false alarm**. The Mnemosyne plugin reads `memory.mnemosyne.<key>` directly; the warning is just
+> the Hermes core schema not knowing the plugin's keys. The key is live at provider access.
+
+Now the trap. If you let the two agents create the DB by racing, **whichever uid opens it first owns
+the file at mode `0644`** — because **SQLite forces new database files to `0644`, ignoring your umask
+entirely.** The other uid then gets `attempt to write a readonly database`. It is **not** a
+fundamental "two uids can't share one SQLite DB" limit — it's purely a creation-order + file-mode
+artifact:
+
+```bash
+# umask 0002 does NOT help — SQLite ignores it:
+umask 0002; python3 -c "import sqlite3,os,stat; sqlite3.connect('/tmp/t.db').execute('create table x(a)'); print(oct(stat.S_IMODE(os.stat('/tmp/t.db').st_mode)))"
+# => 0o644   (not 0o664)
+# POSIX default ACLs also DON'T save you — SQLite sets an explicit group mask of r--.
+```
+
+**The fix is a one-time pre-create at 0660** — durable, because SQLite only forces the mode at *initial
+creation* and never resets an existing file's permissions on reopen:
+
+```bash
+# Pre-create the shared DB (as either agent), then set it group-writable ONCE:
+sudo -u deirdre-ai /path/to/hermes/venv/bin/python -c "import sqlite3; c=sqlite3.connect('/var/lib/agent-shared/mnemosyne.db'); c.execute('PRAGMA journal_mode=WAL'); c.close()"
+sudo chgrp agent-shared /var/lib/agent-shared/mnemosyne.db
+sudo chmod 0660         /var/lib/agent-shared/mnemosyne.db
+stat -c '%A %U:%G' /var/lib/agent-shared/mnemosyne.db   # => -rw-rw---- <uid>:agent-shared
+# Reopen-and-write does NOT reset it back to 0644 — verified: perms survive reopen.
+```
+
+#### 14.2.4 The WAL sidecars — why both gateways must run umask 0002
+
+WAL mode creates `-wal` and `-shm` sidecar files next to the DB. Two facts matter: they're created on
+open and checkpoint-deleted on the last connection close (so you can't just chmod them once — they're a
+moving target), and whichever process creates a sidecar owns its mode. If that lands `0644`, the other
+uid is momentarily locked out even though the main DB is `0660`.
+
+The clean, no-daemon fix is to ensure **both gateways run `umask 0002`** (they do by default under the
+systemd user session). Under 0002, the sidecars each process creates land `0660` group-writable, so
+cross-uid concurrent writing works.
+
+```bash
+# Confirm each gateway's umask at the process level:
+grep '^Umask:' /proc/<gateway-pid>/status      # => 0002
+```
+
+A concurrent two-writer smoke test (WAL + `busy_timeout`) should report **zero readonly errors and zero
+lock waits** — `busy_timeout` handles same-uid lock *contention*; the 0660 + umask 0002 combination
+handles the cross-uid *permission* wall. They are different problems; you need both.
+
+#### 14.2.5 Prove the channel end-to-end — through the live gateway, not just the file
+
+The real acceptance test is a round-trip through each agent's **live gateway provider**, not a
+standalone script hitting the file:
+
+```
+# Agent A writes a marker via its tool:
+#   mnemosyne_shared_remember("PROVISIONING-PROOF-<A> ...")
+# Agent B recalls it via ITS tool and confirms bank:surface:
+#   mnemosyne_shared_recall("provisioning proof")  ->  result tagged  bank: surface
+```
+
+To be sure the recall genuinely ran *through the gateway* (not a direct DB read), confirm the tool
+process is a child of the gateway: `echo ppid=$PPID` should equal the gateway MainPID. Do it **both
+directions** — A→B and B→A — before declaring the channel proven. In our bring-up the file layer passed
+well before the live-provider layer did (a stale provider had the pre-config path cached), so the file
+test alone would have been a false green.
+
+| Check | Proves |
+|---|---|
+| `/proc/<gw-pid>/status` Groups includes the shared gid | The running gateway (not just the shell) holds the group |
+| `sudo -u <other> touch` in the dir succeeds | Setgid + membership are functionally live, not just in the group DB |
+| Shared DB is `-rw-rw---- :agent-shared` and survives reopen | The 0644 creation-mode trap is neutralized durably |
+| Live `-wal`/`-shm` are `0660 agent-shared` under concurrent write | umask 0002 keeps sidecars group-writable; no cross-uid lockout |
+| `mnemosyne_shared_recall` returns the other agent's row `bank:surface`, both directions, tool `ppid == gateway pid` | The channel works through both **live providers**, not just the file |
+
+---
+
+### 14.3 Shared Skills — one git-backed folder both agents load from
+
+The surface DB (§14.2) shares *facts*. The next thing two agents want to share is *procedures* —
+**skills**. Hermes loads skills from `~/.hermes/skills/` **plus** any directory listed in
+`skills.external_dirs`, so you can point both agents at **one shared, git-backed skills folder**
+and have a skill authored by agent A load in agent B. The plumbing reuses the exact `agent-shared`
+group + setgid directory from [§14.2.1](#1421-the-group--directory-setgid-is-mandatory), so if you did
+§14.2 the hard part is already done. What's new here is a different failure surface: **provenance,
+load-path precedence, and file modes** — and every one of them will happily let you *think* it worked
+while it's quietly broken. This is the verified recipe.
+
+> **Move, not copy.** The rule that keeps this sane: when a skill goes into the shared folder, it is
+> **removed** from the author's local `~/.hermes/skills/` in the same breath. A local copy left behind
+> **shadows** the shared one (local dir wins name resolution), so the two agents silently diverge — you
+> edit the shared copy and the author keeps loading their stale local. Share = relocate, not duplicate.
+
+#### 14.3.1 The directory + config wiring
+
+Reuse the §14.2.1 group and setgid dir; a git repo inside it gives you history and rollback:
+
+```bash
+# As admin (or either agent, if the parent dir is already group-writable from §14.2.1):
+sudo install -d -m 2775 -g agent-shared /var/lib/agent-shared/skills
+cd /var/lib/agent-shared/skills && git init -q          # history + rollback for shared edits
+
+# Cross-uid git safety: the repo is owned by one uid but read/written by both. Without this,
+# git refuses to operate for the non-owner ("detected dubious ownership"). Run as EACH agent:
+git config --global --add safe.directory /var/lib/agent-shared/skills
+```
+
+Then point each agent's config at it. `skills.external_dirs` is a **YAML list**, and getting a list
+value in correctly is **the config trap that eats the most time:**
+
+```bash
+# Read the current value first — it may already exist and you want to APPEND, not overwrite:
+hermes config get skills.external_dirs
+```
+
+The value must land as a genuine YAML **block-sequence**. The reliable, verified way to add a list
+item is a **round-trip YAML editor** (`ruamel.yaml`, which preserves formatting and comments) driven
+through `hermes config edit` — *not* a bare `hermes config set`. Two mechanism facts matter, and both
+bite if you skip them:
+
+- `hermes config edit` takes **no flags** — there is no `--editor`. It opens the config in whatever
+  `$EDITOR` points to, invoking it with the **config file path as `$1`**.
+- Hermes `exec`s `$EDITOR` as a **single `argv[0]`** — it does *not* shell-split it. So a multi-word
+  value like `EDITOR="python3 add-dir.py"` fails with `FileNotFoundError: 'python3 add-dir.py'`.
+  `$EDITOR` must be **one executable**. The clean way is a tiny wrapper script:
+
+```python
+# scripts/add-external-skills-dir.py  — the round-trip edit (reads the config path as argv[1])
+import sys
+from ruamel.yaml import YAML
+yaml = YAML()                      # round-trip mode: preserves comments + formatting
+path = sys.argv[1]
+NEW = "/var/lib/agent-shared/skills"
+with open(path) as f:
+    cfg = yaml.load(f)
+skills = cfg.setdefault("skills", {})
+dirs = skills.get("external_dirs")
+if not isinstance(dirs, list):     # normalize a missing/scalar value into a real list
+    dirs = [] if dirs is None else [dirs]
+    skills["external_dirs"] = dirs
+if NEW not in dirs:
+    dirs.append(NEW)
+with open(path, "w") as f:
+    yaml.dump(cfg, f)
+```
+
+```bash
+# scripts/edit-config-wrapper.sh  — a single executable for $EDITOR (no shell-split needed)
+cat > scripts/edit-config-wrapper.sh <<'SH'
+#!/usr/bin/env bash
+exec python3 "$(dirname "$0")/add-external-skills-dir.py" "$1"
+SH
+chmod +x scripts/edit-config-wrapper.sh
+
+# Drive the round-trip edit through hermes config edit (NOT hermes config set):
+EDITOR="$PWD/scripts/edit-config-wrapper.sh" hermes config edit
+
+# Verify it's a LIST with a bare-string item (this read-back IS the acceptance test):
+hermes config get skills.external_dirs        # => - /var/lib/agent-shared/skills
+```
+
+> **Why not just `hermes config set`?** Every `set` form fails to author a real list here (all
+> sandbox-verified):
+> - `hermes config set skills.external_dirs.0 <path>` — the `.0` index creates a **dict** `{'0': <path>}`, which the loader silently ignores.
+> - `hermes config set skills.external_dirs '["/var/lib/agent-shared/skills"]'` — stores the literal **string** `["/var/lib/agent-shared/skills"]`, not a list.
+> - `hermes config set skills.external_dirs <path>` — stores a bare **scalar string**, not a one-element list.
+>
+> There is no `--append` flag and no `set` form that produces a YAML block-sequence — the round-trip
+> editor above is the only path. **Never trust that an edit "took" without reading it back** with
+> `hermes config get` and confirming the `- ` list marker.
+
+#### 14.3.2 GATE 1 — provenance: never share a Hermes/plugin-bundled skill
+
+Before promoting a skill, prove it is **agent-authored**, not something Hermes or a plugin ships. If
+you share a bundled skill and then (per the move-not-copy rule) delete the local copy, on a box where
+the bundle *isn't* present you've just deleted the only copy — and on a box where it *is*, you now have
+a shared fork that drifts from the upstream bundle. We hit the live version of this: `mnemosyne-memory-override`
+looked like a normal local skill but is **plugin-shipped** (installed by the `mnemosyne_hermes` package),
+and deleting its local copy would have removed a guardrail with **no fallback to load**. Check five
+sources, and include a **positive control** so the check can't silently pass everything:
+
+```bash
+VENV=~/.hermes/hermes-agent/venv           # adjust to your tree
+NAME=<skill-to-vet>
+
+# 1. Bundled manifest — the authoritative sha-pinned list of core-shipped skills.
+#    Format is  name:sha  (colon-delimited, NOT space) — match on the colon:
+grep -q "^$NAME:" ~/.hermes/skills/.bundled_manifest && echo "BUNDLED (core) — do NOT share" || echo "not in core manifest"
+# 2. Plugin/venv package data — skills shipped inside an installed pip package:
+find "$VENV"/lib/python*/site-packages -path '*/skills/*/SKILL.md' 2>/dev/null | grep -i "$NAME" && echo "PLUGIN-shipped — do NOT share" || echo "not plugin-shipped"
+# 3. Hermes core repo tree + 4. optional-skills/ tree (if you have a checkout):
+#    grep the skill name under hermes-agent/skills/ and hermes-agent/optional-skills/
+# 5. Git first-author (in the shared repo, once promoted) should be an AGENT identity, not "Hermes Agent".
+
+# POSITIVE CONTROL: the check must actually FIRE on something you KNOW is bundled — otherwise a
+# check that returns "clean" for everything (e.g. wrong manifest path OR wrong delimiter) would pass
+# silently. Pick a name that IS in your manifest and confirm the grep hits it. If it does NOT print
+# "control OK", your check is broken — fix it before trusting any "clean" verdict:
+CONTROL=$(head -1 ~/.hermes/skills/.bundled_manifest | cut -d: -f1)   # a known-bundled name
+grep -q "^$CONTROL:" ~/.hermes/skills/.bundled_manifest && echo "control OK — check fires on bundled skills" || echo "CONTROL FAILED — the check itself is broken, do not trust its output"
+```
+
+Only a skill that is **absent from all bundled sources and first-authored by an agent** is eligible
+to share. Plugin-owned guardrails like `mnemosyne-memory-override` **stay local on every box.**
+
+#### 14.3.3 GATE 2 — load-path probe: prove the shared copy loads *before* deleting the local
+
+"Identical content" **never** proves "safe to delete the local." Local precedence means your loader
+could be serving the local copy while the shared one is broken (wrong path, bad perms, a name
+collision — see 14.3.5), and you'd only find out *after* deleting the local, when there's nothing to
+fall back to. The only proof is a **reversible load-path probe**:
+
+```bash
+# 1. Inject a unique marker into the SHARED copy so a shared-load is unmistakable. Put it on the
+#    COMMITTED shared file (so step 4's `git checkout --` can cleanly revert it):
+echo "<!-- PROV-<agent>-$(date +%s) -->" >> /var/lib/agent-shared/skills/$NAME/SKILL.md
+
+# 2. Move (don't delete) the local aside so precedence can't mask the shared copy.
+#    `**` needs globstar (OFF by default in a non-interactive shell) — enable it or give the exact path:
+shopt -s globstar
+mv ~/.hermes/skills/**/$NAME ~/.hermes/_probe_stash/$NAME    # or the exact ~/.hermes/skills/<cat>/$NAME path
+
+# 3. Load via the agent tool and confirm BOTH: it resolves to the shared dir AND returns the marker:
+#      skill_view($NAME)  ->  skill_dir == /var/lib/agent-shared/skills/$NAME   AND   marker present
+# 4. Restore the local, revert the marker on the shared copy (git -C /var/lib/agent-shared/skills
+#    checkout -- $NAME/SKILL.md), THEN — and only then — delete the local for real. Re-verify with
+#    NOTHING stashed: this is the real end-state.
+```
+
+Do the probe on **both** agents' boxes, each against its own loader — a shared copy readable by one
+uid can still be unreadable by the other (see 14.3.4).
+
+#### 14.3.4 GATE 3 — file modes: tool-authored files land `0600`, and no passive trick fixes it
+
+The nastiest surprise. When an agent authors a file through its **tool layer** (the gateway process),
+the file lands `-rw-------` (`0600`) — because the gateway runs with a restrictive umask (`0077`),
+**not** your interactive shell's `0002`. So a skill agent A writes into the shared folder via its
+tools is **unreadable by agent B**, and B's loader silently can't see it. We chased the "elegant"
+durable fixes and **none of them work on this setup:**
+
+```bash
+# A shell `umask 0002` does NOT help — the GATEWAY writes the file, not your shell.
+# A POSIX default ACL does NOT help either — the file's 0600 mode clamps the ACL mask to ---:
+#   setfacl -d -m group:agent-shared:rw /var/lib/agent-shared/skills   # looks set...
+#   getfacl <file>  ->  group:agent-shared:rw-   #effective:---         # ...but neutered by the mask
+# (And a repo-wide ACL is structurally impossible anyway: ownership spans two uids, so each
+#  agent can only setfacl files it owns.)
+```
+
+The reliable fix is an **explicit `chmod` at hand-off**, verified from the *other* agent's uid — not a
+mount trick that silently doesn't fire:
+
+```bash
+# After authoring/promoting, the AUTHOR fixes the mode on exactly the files it owns:
+chmod 0664 /var/lib/agent-shared/skills/$NAME/SKILL.md
+find /var/lib/agent-shared/skills/$NAME -type f -exec chmod 0664 {} +
+# PROVE it from the OTHER uid (this is the real test — the author's own read tells you nothing):
+sudo -u <other-agent-uid> test -r /var/lib/agent-shared/skills/$NAME/SKILL.md && echo "readable by other agent" || echo "STILL BLOCKED"
+# Sweep for any group-unreadable file left in the repo, so it's closed, not just patched for one file:
+find /var/lib/agent-shared/skills -type f ! -perm -g=r
+```
+
+#### 14.3.5 The staging-teardown trap — leftover merge dirs get scanned as *live skills*
+
+When two agents both authored a same-named skill, you'll stage copies (e.g. under
+`_merge-staging/<agent>/`) to diff and merge them into one shared version. **Remove that staging tree
+before you delete any local copy.** Because the staging dirs live *inside* an `external_dirs` folder,
+the loader scans them as **live skills** — so after a merge you have three copies of the name (the
+promoted root copy plus the two staging copies), and the loader throws an **ambiguous-name collision**
+that makes the skill *unloadable*. It stays invisible while a local copy still exists (local precedence
+masks it) and only detonates the moment you delete the local — exactly when you have the least fallback.
+We hit this live; the 14.3.3 mv-aside probe is what surfaced it before any real delete.
+
+```bash
+# Correct order:
+#   1. promote the merged skill to the repo ROOT
+#   2. git rm -r _merge-staging        # tear down staging FIRST (content is preserved in git history)
+#   3. mv-aside + GATE 2 probe the ROOT copy on BOTH boxes
+#   4. only now delete the local copies
+```
+
+#### 14.3.6 Dual-writer hygiene — `git status` before you touch a shared tree
+
+Both agents can commit to the same repo. Before any tree-wide operation (a `chmod -R`, a bulk edit, a
+`git add -A`), run `git status` first — the *other* agent may have staged or in-flight work you'd
+clobber or accidentally commit. We had a near-miss where one agent's `chmod` pass touched files the
+other was actively probing. No harm done, but the discipline is cheap: **look before you write on
+shared state.**
+
+#### 14.3.7 What "done" actually means here
+
+| Check | Proves |
+|---|---|
+| `hermes config get skills.external_dirs` shows a `- ` list item, not a dict/string | The `external_dirs` wiring took (not the `.0`-index or JSON-string trap) |
+| Candidate skill is absent from `.bundled_manifest`, venv package data, core + optional trees; git first-author is an agent | GATE 1 — it's genuinely agent-authored, safe to share (not a plugin guardrail like `memory-override`) |
+| `skill_view` resolves to `skill_dir=/var/lib/agent-shared/...` with the local moved aside, returning the injected marker | GATE 2 — the shared copy actually loads; safe to delete the local |
+| `sudo -u <other-uid> test -r` succeeds on every shared file; `find ... ! -perm -g=r` is empty | GATE 3 — the tool-authored `0600` mode is fixed for the other agent, repo-wide |
+| No `_merge-staging` (or other nested skill dirs) left under the shared folder | The ambiguous-name collision trap is neutralized before any local delete |
+| Final no-stash `skill_view` on both boxes resolves to the shared dir with no local shadow | The real steady state: one shared source of truth, both agents loading it |
+
+---
+
+## 15. Verifying a Healthy Agent
+
+Before you call an agent "done," each axis below must be **proven**, not assumed. Every failure in this
+tutorial was invisible to a casual "does it answer?" check and only surfaced under a test that tried to
+make it fail. Configure with that adversarial mindset and an agent comes up clean the first time.
+
+### 15.1 The checklist
+
+- [ ] **Model.** Live agent reports the intended frontier model — not the local fallback.
+      `custom_providers:` block present; `api_key` real. (`hermes chat -q "state your model"` — §4.1)
+- [ ] **Fallback.** Real failover observed against a dead primary in an isolated home (saw the
+      "🔄 Switched to fallback model" line — §4.2).
+- [ ] **Memory.** `hermes memory status` → `Plugin: installed ✓`; canary fact recalled; durable facts
+      `scope=global` (§9.3–§9.4).
+- [ ] **Consolidation.** `MNEMOSYNE_LLM_BASE_URL` points at the local vLLM in `~/.hermes/.env`; a fresh
+      episodic summary is clean prose (no `<think>` leak); the auto-sleep journal line appears after ≥10
+      turns, or a forced `sleep_all_sessions(force=True)` backfill produced episodic rows (§9.5).
+- [ ] **Web.** `import ddgs` succeeds in the venv; `FIRECRAWL_API_URL` (bare origin, no `/v1`) set and
+      the local Firecrawl stack answers on `:3002`; live `web_search` returns real URLs and
+      `web_extract` returns page text — both with **no paid key** (§10).
+- [ ] **Backup.** Encrypted archive pushed off-box on a cron; **restored from the cloud copy** and
+      `PRAGMA integrity_check` = `ok`; passphrase pinned off-box; negative test fails loud (§12).
+- [ ] **Discord.** Bot has a managed role (`member_info` shows a non-empty `roles`); the exact
+      privileged action that failed now succeeds (pin/unpin); gateway log shows a `Connected as …`
+      READY line, not a generic `response ready` line (§7.5–§7.6).
+- [ ] 🔀 **(Multi-agent)** Identities isolated — distinct backup passphrases and cloud remotes (§14.1);
+      if sharing memory, the surface-bank round-trip passes both directions through the live gateways
+      (§14.2.5); if sharing skills, `hermes config get skills.external_dirs` shows a `- ` list item and
+      a moved-aside `skill_view` load-path probe resolves to the shared dir on **both** boxes (§14.3).
+
+> The through-line: **prove it, don't report it.**
+
+### 15.2 Automated: `verify-agent-health.sh`
+
+The manual checklist is the spec; [`scripts/verify-agent-health.sh`](scripts/verify-agent-health.sh) is
+the machine-checkable implementation. It probes the **runtime**, not just the config file — because
+"config says on" is not "actually working" (every one of our failures passed a config read and still
+didn't work). Point it at any agent's `$HERMES_HOME` and it returns non-zero if any axis is broken, so
+it drops straight into CI or a multi-box rollup.
+
+```bash
+# Check the current user's agent
+./scripts/verify-agent-health.sh
+
+# Check another agent on the box (e.g. from an admin account)
+sudo HERMES_HOME=/home/second-agent/.hermes ./scripts/verify-agent-health.sh
+
+# Machine-readable, for rolling up results across a fleet of Spark boxes
+./scripts/verify-agent-health.sh --json
+```
+
+What it verifies, mapped to the failure axes in this tutorial:
+
+| Check | Axis | What "PASS" actually proves (runtime, not config) |
+|---|---|---|
+| `model.default` / `model.provider` | §4 | Primary is a real provider, **not** silently `localhost` + `EMPTY` key |
+| `mem.config` / `mem.binary` / `mem.db` | §9 | `provider: mnemosyne` **and** the `mnemosyne` binary resolves **and** the DB is non-trivial |
+| `backup.local` / `backup.offbox` | §12 | A recent `*.tar.zst.gpg` exists **and** the last off-box push returned `rc=0` |
+| `gw.run` / `gw.perms` | §7 | A gateway process is actually **running** for the account **and** no Discord `403 / 50013` in the logs |
+
+Real output from this repo's reference box (`piment`), run against a live agent:
+
+```
+=== Hermes agent health check :: /home/<agent>/.hermes ===
+--- Axis 1: model/provider ---
+  [PASS] model.default = Claude Opus 4.8
+  [PASS] primary base_url set (https://.../argoapi/v1)
+--- Axis 2: long-term memory (Mnemosyne) ---
+  [PASS] memory provider = mnemosyne in config
+  [PASS] mnemosyne CLI resolves (backend installed)
+  [PASS] mnemosyne.db present (1499136 bytes)
+--- Axis 3: backups (local + off-box) ---
+  [PASS] recent encrypted archive (4 h old): <agent>_20260724_195649.tar.zst.gpg
+  [PASS] last off-box push succeeded (rc=0)
+--- Axis 4: Discord gateway ---
+  [PASS] gateway process is running (pid 688234, user <agent>)
+  [FAIL] Discord 403 Missing Permissions (50013) seen — bot role lacks perms
+=== Summary: 8 pass, 0 warn, 1 fail ===
+```
+
+Note the honest `[FAIL]`: on our box the bot genuinely lacked `MANAGE_MESSAGES` (the pin/unpin
+permission). That's a **Discord OAuth-invite-scope** fix (§7.6), not a config-file fix — and the script
+is doing its job by refusing to report green when a real permission gap exists. A checker that only ever
+prints PASS is worthless; this one exits non-zero until the gap is closed or explicitly waived.
+
+> **Two bugs we hit writing this script — worth knowing if you adapt it.** (1) `find "$HOME"` breaks
+> under `sudo` because `$HOME` becomes `/root`; derive the account root from `$HERMES_HOME`'s parent
+> instead. (2) The gateway-exit-diag log **only ever records failures** — it never logs a healthy
+> running state — so counting "zero clean exits" falsely flags a perfectly healthy gateway as
+> crash-looping. The authoritative signal for "is the gateway up?" is a live `pgrep`, not a log count.
+
+---
+
+## 16. Reproducibility Checklist
 
 For team deployments across multiple Spark boxes, capture:
 
@@ -688,28 +1558,37 @@ Commit these (minus secrets) so another box can be brought up identically.
 
 ---
 
-## 13. Troubleshooting
+## 17. Troubleshooting
 
-The main walkthrough (§1–§12) is the **clean deploy path** for a fresh box. This section collects the
+The main walkthrough (§1–§16) is the **clean deploy path** for a fresh box. This section collects the
 **known traps, silent failures, and "this bit us" war-stories** — each as *symptom → cause → proof/fix* —
 so they don't clutter the happy path. Reach for a subsection only when its symptom matches.
 
-### 13.1 Quick reference
+### 17.1 Quick reference
 
 | Symptom | Fix |
 |---|---|
 | `hermes` not found after install | `source ~/.bashrc`; confirm the installer added it to `PATH` |
+| Agent boots but is "dim" / weak reasoning | Bare `provider: custom` with no `custom_providers:` block silently ran the local model — see [§4.1](#41-the-silent-downgrade-trap--define-custom_providers-explicitly) |
 | Model/provider errors | `hermes doctor`; check the API key in `~/.hermes/.env`; `hermes auth` for OAuth providers |
-| Discord bot **online but ignores messages** | Enable **Message Content Intent** — see [§13.2](#132-discord-gateway) |
-| Discord bot **can't pin / `403 Missing Permissions (50013)`** | Re-invite with a role granting `Manage Messages` — see [§13.2](#132-discord-gateway) |
-| Discord bot not in member sidebar | Same root cause — no managed role from the invite — see [§13.2](#132-discord-gateway) |
-| `hermes memory status` shows `Plugin: NOT installed ✗` | Install into the **Hermes venv** + `mnemosyne-install` + **restart** — see [§13.3](#133-memory-mnemosyne) |
-| Memory status green but recall returns nothing | Scope is `session` not `global` (§9.3), wrong venv, or missing restart — see [§13.3](#133-memory-mnemosyne) |
-| Google OAuth `Error 403: access_denied` | Add your account as a **test user** at the OAuth audience page — see §10.2 |
+| Discord bot **online but ignores messages** | Enable **Message Content Intent** — see [§17.2](#172-discord-gateway) |
+| Discord bot **can't pin / `403 Missing Permissions (50013)`** | Re-invite with a role granting `Manage Messages` — see [§17.2](#172-discord-gateway) |
+| Discord bot not in member sidebar | Same root cause — no managed role from the invite — see [§17.2](#172-discord-gateway) |
+| `hermes memory status` shows `Plugin: NOT installed ✗` | Install into the **Hermes venv** + `mnemosyne-install` + **restart** — see [§17.3](#173-memory-mnemosyne) |
+| Memory status green but recall returns nothing | Scope is `session` not `global` (§9.3), wrong venv, or missing restart — see [§17.3](#173-memory-mnemosyne) |
+| Episodic summaries are `<think>` garbage | Reasoning-model summarizer truncated at 2048 tokens — raise `MNEMOSYNE_LLM_MAX_TOKENS` (§9.3) |
+| `episodic: 0` on a fresh gateway | The 10th-turn auto-sleep gate, not a break — see [§9.5](#95-auto-sleep-fires-only-every-10th-turn--the-gate-that-looks-like-a-broken-install) |
+| Google OAuth `Error 403: access_denied` | Add your account as a **test user** at the OAuth audience page — see §11.2 |
 | Gateway dies on SSH logout | `sudo loginctl enable-linger $USER` |
 | Gateway crash loop | `systemctl --user reset-failed hermes-gateway` |
+| Web search returns "no backend available" | `pip install ddgs` in the Hermes venv — see [§10.1](#101-ddgs-is-a-python-package-not-an-api) |
+| 🔀 2nd agent: `attempt to write a readonly database` (shared DB) | SQLite created it `0644` — pre-create at `0660` — see [§14.2.3](#1423-the-trap-that-looks-like-a-hard-blocker-but-isnt-sqlites-creation-mode-0644) |
+| 🔀 2nd agent: new group not live after `usermod` | Cycle the **user manager**, not the service — see [§14.2.2](#1422-the-trap-that-wastes-an-hour-usermod-needs-a-user-manager-cycle-not-a-service-restart) |
+| 🔀 Shared skill authored by agent A unreadable by agent B | Tool-authored files land `0600`; `chmod 0664` at hand-off + verify from the other uid — see [§14.3.4](#1434-gate-3--file-modes-tool-authored-files-land-0600-and-no-passive-trick-fixes-it) |
+| 🔀 `skills.external_dirs` set but shared skills don't load | It stored as a dict/string, not a YAML list — use the round-trip editor — see [§14.3.1](#1431-the-directory--config-wiring) |
+| 🔀 Shared skill becomes unloadable ("ambiguous name") after deleting local | Leftover `_merge-staging` dirs scanned as live skills — tear them down first — see [§14.3.5](#1435-the-staging-teardown-trap--leftover-merge-dirs-get-scanned-as-live-skills) |
 
-### 13.2 Discord gateway
+### 17.2 Discord gateway
 
 **Bot is online (green) but silently ignores every message — no error anywhere.**
 Cause: **Message Content Intent** was not enabled. When you invite a bot *with* a permissions
@@ -720,18 +1599,18 @@ restart the gateway.
 *Proof it's fixed:* send the bot an allowed message and confirm it replies.
 
 **Bot can't pin (`403 Missing Permissions (50013)`) and/or doesn't render in the member sidebar.**
-Cause — *the trap that cost us a day on the second agent:* when you invite a bot with a permissions
-bitmask, Discord auto-creates a **managed role** carrying those permissions. We invited our second
-agent with a bare `bot`-scope link and **no permissions selected**, so it landed on `@everyone` only
-with `roles: []` — hence 403 on every pin and no member-sidebar entry. **A bot cannot grant itself a
-role.** Fix: re-invite via an **OAuth2 URL** with the correct **Bot Permissions** (at minimum
-`Manage Messages` for pinning) — see §7.3.
+Cause: when you invite a bot with a permissions bitmask, Discord auto-creates a **managed role**
+carrying those permissions. Invite with a bare `bot`-scope link and **no permissions selected** and it
+lands on `@everyone` only with `roles: []` — hence 403 on every pin and no member-sidebar entry. **A
+bot cannot grant itself a role.** Fix: re-invite via an **OAuth2 URL** with the correct **Bot
+Permissions** (at minimum `Manage Messages` for pinning) — see §7.3. On a multi-agent box this is the
+day-one trap for the *second* bot specifically — see [§7.6](#76--multiple-agents-only--roles-and-permissions-for-a-second-bot).
 *Proof it's fixed:* the bot now shows a non-empty `roles` array and a pin/unpin round-trips without a 403.
 
-> Provisioning a **second** bot on the same server hits extra role/permission edges — see the companion
-> doc's [§5 Discord — roles and permissions](docs/spinning-up-a-second-agent.md#5-discord--roles-and-permissions).
+### 17.3 Memory (Mnemosyne)
 
-### 13.3 Memory (Mnemosyne)
+The clean deploy path is §9.1–§9.5. The items below are **workarounds and known upstream traps** — you
+should not need them on a fresh, correctly-configured box. Reach for one only when its symptom matches.
 
 **`hermes memory status` shows `Plugin: NOT installed ✗` right after a correct install.**
 Two silent causes:
@@ -746,38 +1625,184 @@ Two silent causes:
   ```
   *(`mnemosyne-install` lives inside the venv; the `mnemosyne` CLI is exposed on `~/.local/bin`.)*
 
-**Memory status is green but recall returns nothing.** Usual culprits: scope is `session` not
-`global` (§9.3), the bridge went into the wrong venv (§9.2), or no restart after install (above). The
-full break-by-break analysis with a proof step for each is in the companion doc's
-[§3 Memory (Mnemosyne) — the three-way break](docs/spinning-up-a-second-agent.md#3-memory-mnemosyne--the-three-way-break),
-and the scope/migration overrides live in [§9.5 Memory troubleshooting](#95-memory-troubleshooting).
+**Memory status is green but recall returns nothing.** Usual culprits: scope is `session` not `global`
+(§9.3), the bridge went into the wrong venv (§9.2), or no restart after install (above). The scope
+mechanics, by stored scope, proven with a fresh DB and real store→recall across two session IDs:
 
-### 13.4 Local serving & ARM64 build issues
+| Stored scope | no env var | `MNEMOSYNE_CROSS_SESSION=1` |
+|---|---|---|
+| `scope=global`  | ✅ recalled cross-session | ✅ recalled |
+| `scope=session` | ❌ not recalled            | ✅ recalled |
+
+This is why `default_scope=global` (§9.3) is the fix on a fresh install: global rows recall
+cross-session with no env var at all.
+
+#### 17.3.1 Migrating a pre-existing DB with legacy `scope=session` rows
+
+**When you need this:** *only* if you switched to `default_scope=global` **after** already storing
+facts at the default `scope=session` (i.e. you're migrating an existing DB). On a **fresh install**
+configured with `default_scope=global` from the start, **you do not need this** — every new fact is
+already global.
+
+`MNEMOSYNE_CROSS_SESSION=1` drops session filtering entirely (the recall filter becomes `(1=1)`), so it
+*additionally* exposes any `session`-scoped rows written before the switch. Set it via a **systemd
+drop-in** so it survives `hermes gateway install` regenerating the unit:
+
+```bash
+mkdir -p ~/.config/systemd/user/hermes-gateway.service.d
+cat > ~/.config/systemd/user/hermes-gateway.service.d/10-mnemosyne-cross-session.conf <<'EOF'
+[Service]
+Environment="MNEMOSYNE_CROSS_SESSION=1"
+EOF
+systemctl --user daemon-reload && systemctl --user restart hermes-gateway   # same restart rule as §9.2
+
+# Prove it landed in the LIVE process, not just the unit file:
+tr '\0' '\n' < /proc/$(pgrep -u "$USER" -f hermes-gateway | head -1)/environ | grep MNEMOSYNE
+# expect: MNEMOSYNE_CROSS_SESSION=1
+# (Only reliable for a systemd drop-in var — NOT for a var living in .env; see §17.3.4.)
+```
+
+> **⚠️ Known bug: the `cross_session` *config key* is a no-op for recall — it's env-var-only.**
+> (Re-verified on Mnemosyne v3.14.0.) `beam.py`'s `_cross_session_enabled()` reads only
+> `os.environ["MNEMOSYNE_CROSS_SESSION"]` at import time and never consults the config resolver.
+> Verified: with `cross_session: true` in config, `config.get("cross_session")` returns `True` while
+> `_cross_session_enabled()` still returns `False`. **The override only works via the env var.** The
+> `default_scope: global` mechanism in §9.3 is unaffected — it goes through the normal SQL filter, not
+> the toggle.
+
+#### 17.3.2 Seeding facts from the shell — `mnemosyne store` defaults to `scope=session`
+
+If you seed memories from the shell with `mnemosyne store`, its default scope is read **only** from the
+`MNEMOSYNE_DEFAULT_SCOPE` environment variable — it ignores *both* config files (including the
+`hermes config` key from §9.3) and falls back to `session`. To store globally from the CLI:
+
+```bash
+MNEMOSYNE_DEFAULT_SCOPE=global mnemosyne store "a durable fact"   # else it lands scope=session
+```
+
+> **⚠️ Do not pass `--scope` to `mnemosyne store`.** It is **positional** —
+> `store <content> [source] [importance]`, no flags. `mnemosyne store "fact" --scope global` fails with
+> `Error: importance must be a number: global` and **stores nothing**.
+
+> **⚠️ Upstream bug (re-verified on Mnemosyne v3.14.0):** `mnemosyne config set default_scope global`
+> writes Mnemosyne's own `~/.hermes/mnemosyne/config.yaml`, and `mnemosyne config get` reads it back
+> (so it *looks* applied), but `store` bypasses the config resolver entirely — `cli.py`'s `cmd_store`
+> → `_resolve_default_scope()` reads only the `MNEMOSYNE_DEFAULT_SCOPE` env var. So
+> `mnemosyne config set default_scope global` is effectively a **no-op** for what scope actually gets
+> stored. The agent bridge does *not* use this file either; it reads `memory.mnemosyne.default_scope`
+> from *Hermes* config (§9.3). Reported upstream.
+
+#### 17.3.3 False negative: a hand-built provider in a REPL always reports `scope=session`
+
+**Symptom:** you spin up a `MnemosyneMemoryProvider()` in a Python REPL to "check" the scope, and it
+reports `session` even though `memory.mnemosyne.default_scope` is correctly `global` — making a
+correctly-configured system *look broken*.
+
+**Root cause (a harness gap, not a bug):** the provider learns where Hermes' config lives *only* from a
+`hermes_home` kwarg passed at init (`self._hermes_home = kwargs.get("hermes_home", "")` — there is
+**no** fallback to `HERMES_HOME` or `get_hermes_home()`). A hand-rolled `MnemosyneMemoryProvider()`
+gets `_hermes_home=""`, `read_hermes_config_key("", …)` returns `None`, and the default scope silently
+stays `session`.
+
+**Fix — validate through the live agent, not a hand-built provider.** Use the §9.4 step #4 proof: have
+the agent store a fact via the gateway, then read the row's scope back from the DB and expect
+`scope=global`.
+
+#### 17.3.4 Where the `MNEMOSYNE_*` env vars go, and how to verify them
+
+**These are env vars → they live in `~/.hermes/.env`, *not* a systemd drop-in.** Hermes' invariant:
+behavioral *settings* go in `config.yaml` (via `hermes config set`); *env vars / secrets* go in
+`~/.hermes/.env`. `gateway/run.py` calls `load_hermes_dotenv(...)` at **module-import time** and applies
+the **user** `~/.hermes/.env` with **`override=True`**, *before* the Mnemosyne bridge imports
+`local_llm.py` whose `LLM_*` constants are read once at import — so `.env` populates `os.environ` in
+time. A systemd `Environment=` drop-in also works but only under that exact unit; `.env` is portable
+across CLI, gateway, and one-off subprocess, so it's the canonical home.
+
+```bash
+# ~/.hermes/.env  (direct edit is sanctioned — .env is not write-guarded; `hermes config env-path`
+#  only PRINTS the path.)
+MNEMOSYNE_LLM_ENABLED=true
+MNEMOSYNE_LLM_BASE_URL=http://localhost:8000/v1
+MNEMOSYNE_LLM_MODEL=<served-model-name>
+```
+
+> **⚠️ Use the *user* `~/.hermes/.env`, not a project `.env`.** Only the user env is loaded with
+> `override=True`. A **project** `.env` is loaded with `override=(not loaded)`, so if a user `.env`
+> already exists, `MNEMOSYNE_*` in a project `.env` gets `override=False` and a stale shell export can
+> win. Put the vars in `~/.hermes/.env`.
+
+> **⚠️ Verification gotcha — do NOT check `.env`-loaded vars via `/proc/<pid>/environ`.** That file is
+> an **exec-time snapshot**; `load_hermes_dotenv()` mutates `os.environ` **at runtime**, invisible to
+> `/proc/<pid>/environ`. So a var loaded from `.env` reads as "missing" there even though the process
+> has it. (The `/proc/.../environ` check is only reliable for a var set via a systemd `Environment=`
+> drop-in — e.g. `MNEMOSYNE_CROSS_SESSION` in §17.3.1.) The correct probe replays the loader in a clean
+> environment:
+
+```bash
+# From the agent's Hermes venv dir. Proves what .env actually loads — independent of /proc.
+env -i HOME=/home/<user> HERMES_HOME=/home/<user>/.hermes PATH=/usr/bin:/bin \
+  ./venv/bin/python -c "import os; from pathlib import Path; \
+from hermes_cli.env_loader import load_hermes_dotenv; \
+load_hermes_dotenv(hermes_home=Path(os.environ['HERMES_HOME']), project_env=None); \
+print({k: os.environ.get(k) for k in \
+  ('MNEMOSYNE_CROSS_SESSION','MNEMOSYNE_LLM_ENABLED','MNEMOSYNE_LLM_BASE_URL','MNEMOSYNE_LLM_MODEL')})"
+```
+
+#### 17.3.5 The `auto_sleep`-defaults-to-false bug — and why the env var alone may not fix it
+
+There was a real bug where the Hermes Mnemosyne plugin's config schema set `auto_sleep`'s default to
+**`False`**, overriding Mnemosyne core's default of `True`. On an affected fresh install, memory
+*appears* to work but **never consolidates**. Tracked as
+[NousResearch/hermes-agent#59836](https://github.com/NousResearch/hermes-agent/issues/59836); first
+patch [mnemosyne-oss/mnemosyne#420](https://github.com/mnemosyne-oss/mnemosyne/pull/420) (partial),
+**superseded by the merged full fix [#429](https://github.com/mnemosyne-oss/mnemosyne/pull/429)**.
+
+**Check the effective default on *your* installed version — don't assume:**
+
+```bash
+python -c "import mnemosyne_hermes, os; print(os.path.dirname(mnemosyne_hermes.__file__))"
+grep -n '"key": "auto_sleep"' "$(python -c 'import mnemosyne_hermes,os;print(os.path.dirname(mnemosyne_hermes.__file__))')/__init__.py"
+# Fixed version reads:  ... "default": True    Buggy version reads:  ... "default": False
+```
+
+**The load-bearing detail: resolution order. `config.yaml` beats the env var.**
+
+```
+kwargs  >  config.yaml key  >  MNEMOSYNE_AUTO_SLEEP_ENABLED env var  >  hardcoded schema default
+```
+
+So if a broken install already **wrote `auto_sleep: false` into `config.yaml`**, then setting
+`MNEMOSYNE_AUTO_SLEEP_ENABLED=true` in `.env` is **silently ignored** — the config key wins. (The
+inverse historical trap: per [mnemosyne-oss/mnemosyne#48](https://github.com/mnemosyne-oss/mnemosyne/issues/48),
+fixed May 2026, *pre-#48 builds* ignored the config key entirely and **only** the env var worked. So:
+current build → set the config key; pre-#48 build → env var is the only lever.)
+
+**Fix it in the right layer (priority order):**
+
+1. **Preferred — set the config key** (it wins the precedence race on current builds):
+   ```bash
+   grep -n 'auto_sleep' ~/.hermes/config.yaml || echo "no auto_sleep key — env var/default governs"
+   hermes config set memory.mnemosyne.auto_sleep true
+   ```
+2. **Belt-and-suspenders — the env var**, for versions where the config path isn't wired or the key is
+   absent (add to `~/.hermes/.env` per §17.3.4):
+   ```bash
+   MNEMOSYNE_AUTO_SLEEP_ENABLED=true
+   ```
+   Harmless on fixed versions; the actual workaround on pre-#429 builds — **but only when no
+   `config.yaml auto_sleep` key shadows it.**
+
+> **Verify the whole chain.** After changing either, grep `~/.hermes/config.yaml` for the key, confirm
+> the env var resolves (§17.3.4 clean-env probe), **restart the gateway**, and treat the auto-sleep
+> journal line (§9.5) as the proof it worked — not the fact that you set a flag.
+
+### 17.4 Local serving & ARM64 build issues
 
 | Symptom | Fix |
 |---|---|
 | pip package builds from source (ARM64) | Ensure `build-essential` (+ `cmake`/`ninja`) are installed |
 | vLLM OOM on GB10 | Lower `--max-model-len` and `--gpu-memory-utilization`; pick a smaller/quantized model |
 | Auxiliary tasks (vision/compression) fail silently | Set `OPENROUTER_API_KEY` or `GOOGLE_API_KEY`, or configure `auxiliary.*.provider` |
-
----
-
-## 14. Running a Second Agent on the Same Box
-
-Standing up a **second, fully independent agent** (its own Linux user, `$HERMES_HOME`, memory,
-backups, and Discord bot) has its own set of sharp edges — model wiring that silently downgrades to
-the local model, memory that recalls nothing cross-session, backups that never actually push
-off-box, and a Discord bot with no role. We hit all of them provisioning our second agent, and wrote
-them up with symptom → root cause → fix → **verification** for each:
-
-**→ [Spinning Up a Second Hermes Agent (and Not Botching It)](docs/spinning-up-a-second-agent.md)**
-
-Start with its [Five-Point Pre-Flight Checklist](docs/spinning-up-a-second-agent.md#7-the-five-point-pre-flight-checklist).
-
-Once both agents are healthy, the companion doc also covers **sharing state between them** — a
-[cross-agent surface memory DB](docs/spinning-up-a-second-agent.md#8-shared-memory--a-cross-agent-surface-db-two-uids-can-actually-both-write)
-two uids can both write, and a [shared git-backed skills folder](docs/spinning-up-a-second-agent.md#9-shared-skills--one-git-backed-folder-both-agents-load-from)
-both agents load from (with the provenance, load-path, and file-mode gates that make it safe).
 
 ---
 
