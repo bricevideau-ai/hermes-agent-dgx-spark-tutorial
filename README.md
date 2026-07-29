@@ -547,7 +547,9 @@ It's slow on a box whose GPU is already serving a good model, and a reasoning GG
 sludge the cleaner doesn't fully strip. The local vLLM you stood up in §6 is sitting right there.
 The remote-API path fires when `MNEMOSYNE_LLM_BASE_URL` is set **and** `MNEMOSYNE_LLM_ENABLED` is not
 false; `LLM_ENABLED` **defaults to `true`**, so in practice *just setting the base URL* switches
-consolidation onto vLLM. Measured A/B on our boxes: vLLM produced a faithful ~450-char summary in
+consolidation onto vLLM. (If you want to read the source: the call lives in
+`mnemosyne/core/local_llm.py::summarize_memories()`, which is what dispatches to the vLLM vs. CPU-GGUF
+path.) Measured A/B on our boxes: vLLM produced a faithful ~450-char summary in
 **~16 s**; the CPU GGUF took **~21 s+** and emitted `<think>` sludge with no usable output.
 
 > **⚠️ Footgun: `MNEMOSYNE_FORCE_LOCAL`.** Setting `MNEMOSYNE_FORCE_LOCAL=1` (or `true`/`yes`) forces
