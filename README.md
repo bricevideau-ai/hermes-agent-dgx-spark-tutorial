@@ -149,25 +149,11 @@ hermes chat -q "In one sentence, what are you running on?"
 hermes            # interactive
 ```
 
-### 4.1 The silent-downgrade trap — define `custom_providers:` explicitly
+### 4.1 Define `custom_providers:` explicitly
 
-**Symptom.** The agent boots and answers, but is noticeably dim — shallow reasoning, misreads its own state. ("Barely conscious," in our notes.) Nothing errors.
+A `provider: custom` entry with **no** matching `custom_providers:` block resolves straight to whatever `base_url` points at, with no model metadata and no validation. If that URL happens to be a weak local endpoint, the agent runs on it silently — it boots, answers, and never errors, because the config is technically valid. The result is an agent that is quietly running on the wrong model.
 
-**Root cause.** A *bare* custom provider with no matching `custom_providers:` block:
-
-```yaml
-# BROKEN — what we actually shipped first
-model:
-  default: nemotron
-  provider: custom
-  base_url: http://localhost:8000/v1
-  api_key: EMPTY
-# ...and NO custom_providers: block anywhere in the file.
-```
-
-With no `custom_providers:` entry, `provider: custom` resolves straight to whatever `base_url` says — here, the **local Nemotron** on `localhost:8000`. The agent silently ran on the weak local model when we thought we'd pointed it at a frontier model. It never complained because, from the config's point of view, this is a perfectly valid setup.
-
-**Fix.** Define the provider explicitly and point `model.default` at the real model:
+Avoid this by always declaring the provider explicitly and pointing `model.default` at the real model:
 
 ```yaml
 model:
@@ -181,66 +167,127 @@ custom_providers:
     base_url: https://<your-gateway>/v1
     api_key: <your-key>
     model: Claude Opus 4.8
+    api_mode: chat_completions
     models:
       - Claude Opus 4.8
       - Claude Sonnet 5
       # ...whatever the gateway serves
-  - name: Local Nemotron
+  - name: Local vLLM
     base_url: http://localhost:8000/v1
-    model: nemotron
+    model: <local-model>
     api_mode: chat_completions
     models:
-      nemotron:
+      <local-model>:
         context_length: 262144
 ```
 
-**Verify — don't assume.** Make the *running* agent tell you what it's on, and cross-check against the raw endpoint:
+**Verify — don't assume.** Make the *running* agent report what it's on, and cross-check the raw endpoint (some servers return `200` with empty content):
 
 ```bash
 # 1. Ask the live agent:
 hermes chat -q "State your exact model and provider base_url in one line."
 
-# 2. Cross-check the raw endpoint actually answers (some servers 200 with empty content):
+# 2. Cross-check the raw endpoint actually completes:
 curl -s http://localhost:8000/v1/chat/completions \
   -H 'Content-Type: application/json' \
-  -d '{"model":"nemotron","messages":[{"role":"user","content":"say ALIVE"}]}' \
+  -d '{"model":"<local-model>","messages":[{"role":"user","content":"say ALIVE"}]}' \
   | python3 -m json.tool
 ```
 
-> A `200` with `content: null` is **not** "working" — a real failure we hit was a healthy `/v1/models` masking a completion path that returned nothing. Read the payload, not just the status code.
+A `200` with `content: null` is **not** working. Read the payload, not just the status code.
 
 ### 4.2 Fallback chain — redundancy in hardware is not redundancy in config
 
-**Symptom.** Single point of failure: if the primary gateway drops, the agent dies. The local GPU is *right there* serving a model, but the agent never uses it.
+Route everything through a single provider and you have a single point of failure: if the primary gateway drops, the agent dies — even with a local GPU sitting right there serving a model. Configure a `fallback_providers` chain so the agent survives an outage on a **different substrate**.
 
-**Root cause.** No `fallback_providers` configured. Everything routed through one provider.
-
-**Fix.** Register the local model (§6) as a fallback. `hermes fallback add` is an **interactive picker** (no scripting flags), and it has a **"Custom endpoint (enter URL manually)"** option near the bottom — use it to point at `http://localhost:8000/v1`. Or declare it directly:
+`hermes fallback add` is an interactive picker (no scripting flags); its **"Custom endpoint (enter URL manually)"** option lets you point at `http://localhost:8000/v1`. Or declare it directly:
 
 ```yaml
 fallback_providers:
   - provider: custom
-    model: nemotron
+    model: <local-model>
     base_url: http://localhost:8000/v1
     api_mode: chat_completions
 ```
 
-> **Design note:** a fallback to *another model on the same gateway* is worthless — when the gateway is down, both go down in the same breath. The only fallback that survives a gateway outage is one on a **different substrate**, i.e. the local GPU. (This is exactly why standing up the local LLM in §6 pays off twice: cheap inference *and* a real failover target.)
+> **Design note:** a fallback to *another model on the same gateway* is worthless — when the gateway is down, both go down together. The only fallback that survives a gateway outage is one on a **different substrate**, i.e. the local GPU. Standing up the local LLM in §6 pays off twice: cheap inference *and* a real failover target.
 
-**Verify — force a real failover.** A fallback in the list is a hypothesis until you watch it catch:
+**Verify — force a real failover.** A fallback in the list is a hypothesis until you watch it catch. In an **isolated** config copy (never your live one), break only the top-level `model.base_url` and fire one query:
 
 ```bash
-# In an ISOLATED copy of the config (never your live one):
 export HERMES_HOME=/tmp/hermes-failover-test
 cp -r ~/.hermes "$HERMES_HOME"
-# Break ONLY the top-level model.base_url (the primary Hermes actually uses):
-#   point it at a dead port, e.g. http://127.0.0.1:59999/v1
-# Then fire one query and watch for the switch line:
+# Edit $HERMES_HOME/config.yaml: set the TOP-LEVEL model.base_url to a dead
+# port, e.g. http://127.0.0.1:59999/v1 (not the first base_url under
+# custom_providers — that's a different line and not the primary route).
 hermes chat -q "Reply exactly: FAILOVER-WORKS"
-# Expect: "🔄 Switched to fallback model: ... → nemotron via custom"  then the answer.
+# Expect: "🔄 Switched to fallback model: ... → <local-model> via custom" then the answer.
 ```
 
-If you `sed` the base_url, confirm you hit the **top-level** `model.base_url` and not the first `base_url` in `custom_providers` — they're different lines and only the top-level one is the primary route.
+### 4.3 Fallback for auxiliary tasks (compression, title generation)
+
+The main model isn't the only thing that calls out. Housekeeping tasks —
+conversation **compression** and **title generation** — run on their own model,
+configured under `auxiliary:`. On a Spark you'll want these on the cheap local
+model, but they must still work when the local server is down, so give each one
+its own `fallback_chain` to a hosted model.
+
+Point the primary at the local endpoint and the fallback at a **cheaper hosted
+model than your main** — there's no reason to spend a frontier model's rate on
+housekeeping. Here the main agent is Opus, so the auxiliary fallback is Sonnet:
+
+```yaml
+auxiliary:
+  compression:
+    provider: custom
+    model: <local-model>
+    base_url: http://localhost:8000/v1
+    api_key: local
+    timeout: 180
+    fallback_chain:
+      - provider: custom
+        model: Claude Sonnet 5
+        base_url: https://<your-gateway>/v1
+        api_key: <your-key>
+        timeout: 300
+  title_generation:
+    provider: custom
+    model: <local-model>
+    base_url: http://localhost:8000/v1
+    api_key: local
+    timeout: 60
+    fallback_chain:
+      - provider: custom
+        model: Claude Sonnet 5
+        base_url: https://<your-gateway>/v1
+        api_key: <your-key>
+        timeout: 300
+```
+
+Notes that bite if you skip them:
+
+- Both `provider: custom` **and** `base_url` are required on the primary and on
+  each fallback entry — a bare `base_url` without `provider: custom` won't
+  engage the fallback ladder.
+- `fallback_chain` is a YAML **block sequence** (a real list). `hermes config
+  set auxiliary.compression.fallback_chain '[...]'` stores a literal string, not
+  a list — author list-valued keys with `hermes config edit`, not `config set`.
+- Changes to `config.yaml` are read at process start: they take effect on the
+  **next gateway restart**, not live.
+
+**Verify.** Confirm the fallback model actually answers on your gateway before
+trusting it, then confirm the config parses as a list:
+
+```bash
+# 1. Prove the fallback model completes on the gateway:
+curl -s https://<your-gateway>/v1/chat/completions \
+  -H "Authorization: Bearer <your-key>" -H "Content-Type: application/json" \
+  -d '{"model":"Claude Sonnet 5","messages":[{"role":"user","content":"say OK"}],"max_tokens":10}' \
+  | python3 -m json.tool
+
+# 2. Prove the config read back as a list, not a string:
+hermes config get auxiliary.compression.fallback_chain.0.model   # -> Claude Sonnet 5
+```
 
 ---
 
