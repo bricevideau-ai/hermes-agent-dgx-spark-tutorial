@@ -229,7 +229,7 @@ custom_providers:
     base_url: https://<your-gateway>/v1
     api_key: <your-key>
     model: Claude Opus 4.8
-    api_mode: chat_completions
+    api_mode: anthropic_messages   # Anthropic models — see the api_mode note below
     models:
       - Claude Opus 4.8
       - Claude Sonnet 5
@@ -237,11 +237,23 @@ custom_providers:
   - name: Local vLLM
     base_url: http://localhost:8000/v1
     model: <local-model>
-    api_mode: chat_completions
+    api_mode: chat_completions     # OpenAI-compatible server (vLLM) — chat_completions is correct
     models:
       <local-model>:
         context_length: 262144
 ```
+
+> **`api_mode` must match the model family, not the gateway.** Anthropic
+> models (Claude Opus, Sonnet, Haiku) speak the Anthropic Messages wire and
+> must use `api_mode: anthropic_messages` — even when reached through an
+> OpenAI-style gateway URL. Routing a Claude model over `chat_completions`
+> can appear to work on some relays but fails hard on others: on an Argo-style
+> gateway it returns **`403 PERMISSION_DENIED`** (the chat-completions path is
+> a different, non-entitled backend endpoint), leaving the model dead with no
+> obvious config error. Use `chat_completions` only for genuinely
+> OpenAI-compatible servers — your local vLLM, OpenAI, most aggregators. The
+> quick test: a Claude model that 403s on completions but returns 200 on
+> `/v1/messages` is telling you to switch modes.
 
 **Verify — don't assume.** Make the *running* agent report what it's on, and cross-check the raw endpoint (some servers return `200` with empty content):
 
@@ -309,6 +321,7 @@ auxiliary:
     fallback_chain:
       - provider: custom
         model: Claude Sonnet 5
+        api_mode: anthropic_messages   # Claude fallback — Anthropic wire, NOT chat_completions
         base_url: https://<your-gateway>/v1
         api_key: <your-key>
         timeout: 300
@@ -321,6 +334,7 @@ auxiliary:
     fallback_chain:
       - provider: custom
         model: Claude Sonnet 5
+        api_mode: anthropic_messages   # Claude fallback — Anthropic wire, NOT chat_completions
         base_url: https://<your-gateway>/v1
         api_key: <your-key>
         timeout: 300
@@ -331,6 +345,11 @@ Notes that bite if you skip them:
 - Both `provider: custom` **and** `base_url` are required on the primary and on
   each fallback entry — a bare `base_url` without `provider: custom` won't
   engage the fallback ladder.
+- **Set `api_mode: anthropic_messages` on every Claude fallback entry.** A
+  fallback entry inherits nothing from the main model's `api_mode`; omit it and
+  the entry defaults to `chat_completions`, which 403s on a Claude model (§5.1).
+  A fallback that fails the same way as the thing it's backing up is not a
+  fallback — prove it with the `/v1/messages` curl below.
 - `fallback_chain` is a YAML **block sequence** (a real list). `hermes config
   set auxiliary.compression.fallback_chain '[...]'` stores a literal string, not
   a list — author list-valued keys with `hermes config edit`, not `config set`.
@@ -341,10 +360,13 @@ Notes that bite if you skip them:
 trusting it, then confirm the config parses as a list:
 
 ```bash
-# 1. Prove the fallback model completes on the gateway:
-curl -s https://<your-gateway>/v1/chat/completions \
-  -H "Authorization: Bearer <your-key>" -H "Content-Type: application/json" \
-  -d '{"model":"Claude Sonnet 5","messages":[{"role":"user","content":"say OK"}],"max_tokens":10}' \
+# 1. Prove the fallback model completes on the gateway.
+#    Claude models use the Anthropic Messages endpoint (/v1/messages), NOT
+#    /v1/chat/completions — the same api_mode: anthropic_messages rule from §5.1.
+curl -s https://<your-gateway>/v1/messages \
+  -H "Authorization: Bearer ***" -H "Content-Type: application/json" \
+  -H "anthropic-version: 2023-06-01" \
+  -d '{"model":"Claude Sonnet 5","max_tokens":10,"messages":[{"role":"user","content":"say OK"}]}' \
   | python3 -m json.tool
 
 # 2. Prove the config read back as a list, not a string:
