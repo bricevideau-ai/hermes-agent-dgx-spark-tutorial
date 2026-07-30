@@ -17,9 +17,9 @@ So: read straight through for one agent; watch for the 🔀 markers if you're ad
 1. [Why Hermes on a DGX Spark](#1-why-hermes-on-a-dgx-spark)
 2. [Prerequisites & Hardware Baseline](#2-prerequisites--hardware-baseline)
 3. [Install Hermes](#3-install-hermes)
-4. [Model & Provider Wiring](#4-model--provider-wiring)
-5. [Verifying the Install (`hermes doctor`)](#5-verifying-the-install-hermes-doctor)
-6. [Wiring Up a Local LLM on the Spark](#6-wiring-up-a-local-llm-on-the-spark)
+4. [Wiring Up a Local LLM on the Spark](#4-wiring-up-a-local-llm-on-the-spark)
+5. [Model & Provider Wiring](#5-model--provider-wiring)
+6. [Verifying the Install (`hermes doctor`)](#6-verifying-the-install-hermes-doctor)
 7. [Adding the Discord Gateway](#7-adding-the-discord-gateway)
 8. [Running Hermes as a Persistent Service](#8-running-hermes-as-a-persistent-service)
 9. [Long-Term Memory (Mnemosyne)](#9-long-term-memory-mnemosyne)
@@ -127,140 +127,11 @@ Config and secrets live under `~/.hermes/`:
 
 ---
 
-## 4. Model & Provider Wiring
-
-Pick a model/provider interactively:
-
-```bash
-hermes setup      # full wizard
-# or just the model picker:
-hermes model
-```
-
-Hermes is provider-agnostic. Common choices:
-
-- **Hosted API** — Anthropic, OpenAI, OpenRouter, Google, DeepSeek, xAI, etc. Set the relevant key in `~/.hermes/.env` (e.g. `OPENROUTER_API_KEY=...`).
-- **Private/OpenAI-compatible gateway** — set `model.base_url` + `model.api_key` in `config.yaml` (the same mechanism §6 uses for a local model).
-
-Quick smoke test, then drop into an interactive session:
-
-```bash
-hermes chat -q "In one sentence, what are you running on?"
-hermes            # interactive
-```
-
-### 4.1 The silent-downgrade trap — define `custom_providers:` explicitly
-
-**Symptom.** The agent boots and answers, but is noticeably dim — shallow reasoning, misreads its own state. ("Barely conscious," in our notes.) Nothing errors.
-
-**Root cause.** A *bare* custom provider with no matching `custom_providers:` block:
-
-```yaml
-# BROKEN — what we actually shipped first
-model:
-  default: nemotron
-  provider: custom
-  base_url: http://localhost:8000/v1
-  api_key: EMPTY
-# ...and NO custom_providers: block anywhere in the file.
-```
-
-With no `custom_providers:` entry, `provider: custom` resolves straight to whatever `base_url` says — here, the **local Nemotron** on `localhost:8000`. The agent silently ran on the weak local model when we thought we'd pointed it at a frontier model. It never complained because, from the config's point of view, this is a perfectly valid setup.
-
-**Fix.** Define the provider explicitly and point `model.default` at the real model:
-
-```yaml
-model:
-  default: Claude Opus 4.8
-  provider: custom
-  base_url: https://<your-gateway>/v1
-  api_key: <your-key>
-
-custom_providers:
-  - name: Argo
-    base_url: https://<your-gateway>/v1
-    api_key: <your-key>
-    model: Claude Opus 4.8
-    models:
-      - Claude Opus 4.8
-      - Claude Sonnet 5
-      # ...whatever the gateway serves
-  - name: Local Nemotron
-    base_url: http://localhost:8000/v1
-    model: nemotron
-    api_mode: chat_completions
-    models:
-      nemotron:
-        context_length: 262144
-```
-
-**Verify — don't assume.** Make the *running* agent tell you what it's on, and cross-check against the raw endpoint:
-
-```bash
-# 1. Ask the live agent:
-hermes chat -q "State your exact model and provider base_url in one line."
-
-# 2. Cross-check the raw endpoint actually answers (some servers 200 with empty content):
-curl -s http://localhost:8000/v1/chat/completions \
-  -H 'Content-Type: application/json' \
-  -d '{"model":"nemotron","messages":[{"role":"user","content":"say ALIVE"}]}' \
-  | python3 -m json.tool
-```
-
-> A `200` with `content: null` is **not** "working" — a real failure we hit was a healthy `/v1/models` masking a completion path that returned nothing. Read the payload, not just the status code.
-
-### 4.2 Fallback chain — redundancy in hardware is not redundancy in config
-
-**Symptom.** Single point of failure: if the primary gateway drops, the agent dies. The local GPU is *right there* serving a model, but the agent never uses it.
-
-**Root cause.** No `fallback_providers` configured. Everything routed through one provider.
-
-**Fix.** Register the local model (§6) as a fallback. `hermes fallback add` is an **interactive picker** (no scripting flags), and it has a **"Custom endpoint (enter URL manually)"** option near the bottom — use it to point at `http://localhost:8000/v1`. Or declare it directly:
-
-```yaml
-fallback_providers:
-  - provider: custom
-    model: nemotron
-    base_url: http://localhost:8000/v1
-    api_mode: chat_completions
-```
-
-> **Design note:** a fallback to *another model on the same gateway* is worthless — when the gateway is down, both go down in the same breath. The only fallback that survives a gateway outage is one on a **different substrate**, i.e. the local GPU. (This is exactly why standing up the local LLM in §6 pays off twice: cheap inference *and* a real failover target.)
-
-**Verify — force a real failover.** A fallback in the list is a hypothesis until you watch it catch:
-
-```bash
-# In an ISOLATED copy of the config (never your live one):
-export HERMES_HOME=/tmp/hermes-failover-test
-cp -r ~/.hermes "$HERMES_HOME"
-# Break ONLY the top-level model.base_url (the primary Hermes actually uses):
-#   point it at a dead port, e.g. http://127.0.0.1:59999/v1
-# Then fire one query and watch for the switch line:
-hermes chat -q "Reply exactly: FAILOVER-WORKS"
-# Expect: "🔄 Switched to fallback model: ... → nemotron via custom"  then the answer.
-```
-
-If you `sed` the base_url, confirm you hit the **top-level** `model.base_url` and not the first `base_url` in `custom_providers` — they're different lines and only the top-level one is the primary route.
-
----
-
-## 5. Verifying the Install (`hermes doctor`)
-
-```bash
-hermes doctor          # checks dependencies + config
-hermes status --all    # component status
-hermes config check    # missing/outdated config keys
-```
-
-Fix anything flagged before moving on. `hermes doctor --fix` auto-resolves common issues.
-
----
-
-## 6. Wiring Up a Local LLM on the Spark
+## 4. Wiring Up a Local LLM on the Spark
 
 This is the payoff of running on a DGX Spark: serve a model **on the box** and point Hermes at it. Any OpenAI-compatible server works — [vLLM](https://github.com/vllm-project/vllm), [llama.cpp](https://github.com/ggerganov/llama.cpp), SGLang, or Ollama. Below uses vLLM as the pattern.
 
-### 6.1 Serve a model (vLLM example)
+### 4.1 Serve a model (vLLM example)
 
 On ARM64 + CUDA, install vLLM into its own venv (keep it isolated from Hermes' venv):
 
@@ -288,7 +159,7 @@ curl -s http://127.0.0.1:8000/v1/models | python3 -m json.tool
 
 > **Tip:** For the DGX Spark's unified-memory architecture, size the model + KV cache to the available pool and tune `--max-model-len` / `--gpu-memory-utilization`. Track each run (model, quant, flags, throughput, latency) in a results log so experiments are comparable across boxes.
 
-### 6.2 Point Hermes at the local server
+### 4.2 Point Hermes at the local server
 
 Add a custom provider in `~/.hermes/config.yaml`:
 
@@ -314,7 +185,207 @@ Restart your session and test:
 hermes chat -q "Say hello from the local model on the Spark."
 ```
 
-Now you can flip between local and hosted models by editing `model.provider` / `model.base_url` — the rest of your agent (skills, memory, gateway) is unaffected. This local endpoint is also what §4.2 uses as a failover target and what §9 uses as the memory-consolidation summarizer.
+Now you can flip between local and hosted models by editing `model.provider` / `model.base_url` — the rest of your agent (skills, memory, gateway) is unaffected. This local endpoint is also what §5.2 uses as a failover target and what §9 uses as the memory-consolidation summarizer.
+
+> **Which model is "main"?** Setting `model.default: local-model` here gives you a fully self-contained agent that runs entirely on the box — the fastest way to confirm the whole stack works end-to-end. In [§5](#5-model--provider-wiring) you'll decide your *production* primary: many Spark setups run a frontier hosted model (e.g. Claude Opus) as `model.default` and keep this local endpoint as the **fallback** (§5.2) and auxiliary-task model (§5.3). Either choice is valid — §5 simply overwrites `model.default` with whichever you pick.
+
+---
+
+## 5. Model & Provider Wiring
+
+Pick a model/provider interactively:
+
+```bash
+hermes setup      # full wizard
+# or just the model picker:
+hermes model
+```
+
+Hermes is provider-agnostic. Common choices:
+
+- **Hosted API** — Anthropic, OpenAI, OpenRouter, Google, DeepSeek, xAI, etc. Set the relevant key in `~/.hermes/.env` (e.g. `OPENROUTER_API_KEY=...`).
+- **Private/OpenAI-compatible gateway** — set `model.base_url` + `model.api_key` in `config.yaml` (the same mechanism §4 uses for a local model).
+
+Quick smoke test, then drop into an interactive session:
+
+```bash
+hermes chat -q "In one sentence, what are you running on?"
+hermes            # interactive
+```
+
+### 5.1 Define `custom_providers:` explicitly
+
+A `provider: custom` entry with **no** matching `custom_providers:` block resolves straight to whatever `base_url` points at, with no model metadata and no validation. If that URL happens to be a weak local endpoint, the agent runs on it silently — it boots, answers, and never errors, because the config is technically valid. The result is an agent that is quietly running on the wrong model.
+
+Avoid this by always declaring the provider explicitly and pointing `model.default` at the real model:
+
+```yaml
+model:
+  default: Claude Opus 4.8
+  provider: custom
+  base_url: https://<your-gateway>/v1
+  api_key: <your-key>
+
+custom_providers:
+  - name: Argo
+    base_url: https://<your-gateway>/v1
+    api_key: <your-key>
+    model: Claude Opus 4.8
+    api_mode: anthropic_messages   # Anthropic models — see the api_mode note below
+    models:
+      - Claude Opus 4.8
+      - Claude Sonnet 5
+      # ...whatever the gateway serves
+  - name: Local vLLM
+    base_url: http://localhost:8000/v1
+    model: <local-model>
+    api_mode: chat_completions     # OpenAI-compatible server (vLLM) — chat_completions is correct
+    models:
+      <local-model>:
+        context_length: 262144
+```
+
+> **`api_mode` must match the model family, not the gateway.** Anthropic
+> models (Claude Opus, Sonnet, Haiku) speak the Anthropic Messages wire and
+> must use `api_mode: anthropic_messages` — even when reached through an
+> OpenAI-style gateway URL. Routing a Claude model over `chat_completions`
+> can appear to work on some relays but fails hard on others: on an Argo-style
+> gateway it returns **`403 PERMISSION_DENIED`** (the chat-completions path is
+> a different, non-entitled backend endpoint), leaving the model dead with no
+> obvious config error. Use `chat_completions` only for genuinely
+> OpenAI-compatible servers — your local vLLM, OpenAI, most aggregators. The
+> quick test: a Claude model that 403s on completions but returns 200 on
+> `/v1/messages` is telling you to switch modes.
+
+**Verify — don't assume.** Make the *running* agent report what it's on, and cross-check the raw endpoint (some servers return `200` with empty content):
+
+```bash
+# 1. Ask the live agent:
+hermes chat -q "State your exact model and provider base_url in one line."
+
+# 2. Cross-check the raw endpoint actually completes:
+curl -s http://localhost:8000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"<local-model>","messages":[{"role":"user","content":"say ALIVE"}]}' \
+  | python3 -m json.tool
+```
+
+A `200` with `content: null` is **not** working. Read the payload, not just the status code.
+
+### 5.2 Fallback chain — redundancy in hardware is not redundancy in config
+
+Route everything through a single provider and you have a single point of failure: if the primary gateway drops, the agent dies — even with a local GPU sitting right there serving a model. Configure a `fallback_providers` chain so the agent survives an outage on a **different substrate**.
+
+`hermes fallback add` is an interactive picker (no scripting flags); its **"Custom endpoint (enter URL manually)"** option lets you point at `http://localhost:8000/v1`. Or declare it directly:
+
+```yaml
+fallback_providers:
+  - provider: custom
+    model: <local-model>
+    base_url: http://localhost:8000/v1
+    api_mode: chat_completions
+```
+
+> **Design note:** a fallback to *another model on the same gateway* is worthless — when the gateway is down, both go down together. The only fallback that survives a gateway outage is one on a **different substrate**, i.e. the local GPU. Standing up the local LLM in §4 pays off twice: cheap inference *and* a real failover target.
+
+**Verify — force a real failover.** A fallback in the list is a hypothesis until you watch it catch. In an **isolated** config copy (never your live one), break only the top-level `model.base_url` and fire one query:
+
+```bash
+export HERMES_HOME=/tmp/hermes-failover-test
+cp -r ~/.hermes "$HERMES_HOME"
+# Edit $HERMES_HOME/config.yaml: set the TOP-LEVEL model.base_url to a dead
+# port, e.g. http://127.0.0.1:59999/v1 (not the first base_url under
+# custom_providers — that's a different line and not the primary route).
+hermes chat -q "Reply exactly: FAILOVER-WORKS"
+# Expect: "🔄 Switched to fallback model: ... → <local-model> via custom" then the answer.
+```
+
+### 5.3 Fallback for auxiliary tasks (compression, title generation)
+
+The main model isn't the only thing that calls out. Housekeeping tasks —
+conversation **compression** and **title generation** — run on their own model,
+configured under `auxiliary:`. On a Spark you'll want these on the cheap local
+model, but they must still work when the local server is down, so give each one
+its own `fallback_chain` to a hosted model.
+
+Point the primary at the local endpoint and the fallback at a **cheaper hosted
+model than your main** — there's no reason to spend a frontier model's rate on
+housekeeping. Here the main agent is Opus, so the auxiliary fallback is Sonnet:
+
+```yaml
+auxiliary:
+  compression:
+    provider: custom
+    model: <local-model>
+    base_url: http://localhost:8000/v1
+    api_key: local
+    timeout: 180
+    fallback_chain:
+      - provider: custom
+        model: Claude Sonnet 5
+        api_mode: anthropic_messages   # Claude fallback — Anthropic wire, NOT chat_completions
+        base_url: https://<your-gateway>/v1
+        api_key: <your-key>
+        timeout: 300
+  title_generation:
+    provider: custom
+    model: <local-model>
+    base_url: http://localhost:8000/v1
+    api_key: local
+    timeout: 60
+    fallback_chain:
+      - provider: custom
+        model: Claude Sonnet 5
+        api_mode: anthropic_messages   # Claude fallback — Anthropic wire, NOT chat_completions
+        base_url: https://<your-gateway>/v1
+        api_key: <your-key>
+        timeout: 300
+```
+
+Notes that bite if you skip them:
+
+- Both `provider: custom` **and** `base_url` are required on the primary and on
+  each fallback entry — a bare `base_url` without `provider: custom` won't
+  engage the fallback ladder.
+- **Set `api_mode: anthropic_messages` on every Claude fallback entry.** A
+  fallback entry inherits nothing from the main model's `api_mode`; omit it and
+  the entry defaults to `chat_completions`, which 403s on a Claude model (§5.1).
+  A fallback that fails the same way as the thing it's backing up is not a
+  fallback — prove it with the `/v1/messages` curl below.
+- `fallback_chain` is a YAML **block sequence** (a real list). `hermes config
+  set auxiliary.compression.fallback_chain '[...]'` stores a literal string, not
+  a list — author list-valued keys with `hermes config edit`, not `config set`.
+- Changes to `config.yaml` are read at process start: they take effect on the
+  **next gateway restart**, not live.
+
+**Verify.** Confirm the fallback model actually answers on your gateway before
+trusting it, then confirm the config parses as a list:
+
+```bash
+# 1. Prove the fallback model completes on the gateway.
+#    Claude models use the Anthropic Messages endpoint (/v1/messages), NOT
+#    /v1/chat/completions — the same api_mode: anthropic_messages rule from §5.1.
+curl -s https://<your-gateway>/v1/messages \
+  -H "Authorization: Bearer ***" -H "Content-Type: application/json" \
+  -H "anthropic-version: 2023-06-01" \
+  -d '{"model":"Claude Sonnet 5","max_tokens":10,"messages":[{"role":"user","content":"say OK"}]}' \
+  | python3 -m json.tool
+
+# 2. Prove the config read back as a list, not a string:
+hermes config get auxiliary.compression.fallback_chain.0.model   # -> Claude Sonnet 5
+```
+
+---
+
+## 6. Verifying the Install (`hermes doctor`)
+
+```bash
+hermes doctor          # checks dependencies + config
+hermes status --all    # component status
+hermes config check    # missing/outdated config keys
+```
+
+Fix anything flagged before moving on. `hermes doctor --fix` auto-resolves common issues.
 
 ---
 
@@ -538,13 +609,13 @@ calling an LLM. Which LLM is controlled by these env vars in `~/.hermes/.env`:
 ```bash
 # In ~/.hermes/.env — the model that writes episodic summaries during consolidation:
 MNEMOSYNE_LLM_ENABLED=true
-MNEMOSYNE_LLM_BASE_URL=http://localhost:8000/v1   # your local vLLM (§6) — no API key needed
+MNEMOSYNE_LLM_BASE_URL=http://localhost:8000/v1   # your local vLLM (§4) — no API key needed
 MNEMOSYNE_LLM_MODEL=<whatever that endpoint serves>
 ```
 
 **Why point it at the local vLLM.** Mnemosyne's **default** consolidation LLM is a CPU llama-cpp GGUF.
 It's slow on a box whose GPU is already serving a good model, and a reasoning GGUF emits `<think>`
-sludge the cleaner doesn't fully strip. The local vLLM you stood up in §6 is sitting right there.
+sludge the cleaner doesn't fully strip. The local vLLM you stood up in §4 is sitting right there.
 The remote-API path fires when `MNEMOSYNE_LLM_BASE_URL` is set **and** `MNEMOSYNE_LLM_ENABLED` is not
 false; `LLM_ENABLED` **defaults to `true`**, so in practice *just setting the base URL* switches
 consolidation onto vLLM. (If you want to read the source: the call lives in
@@ -1461,9 +1532,9 @@ make it fail. Configure with that adversarial mindset and an agent comes up clea
 ### 15.1 The checklist
 
 - [ ] **Model.** Live agent reports the intended frontier model — not the local fallback.
-      `custom_providers:` block present; `api_key` real. (`hermes chat -q "state your model"` — §4.1)
+      `custom_providers:` block present; `api_key` real. (`hermes chat -q "state your model"` — §5.1)
 - [ ] **Fallback.** Real failover observed against a dead primary in an isolated home (saw the
-      "🔄 Switched to fallback model" line — §4.2).
+      "🔄 Switched to fallback model" line — §5.2).
 - [ ] **Memory.** `hermes memory status` → `Plugin: installed ✓`; canary fact recalled; durable facts
       `scope=global` (§9.3–§9.4).
 - [ ] **Consolidation.** `MNEMOSYNE_LLM_BASE_URL` points at the local vLLM in `~/.hermes/.env`; a fresh
@@ -1507,7 +1578,7 @@ What it verifies, mapped to the failure axes in this tutorial:
 
 | Check | Axis | What "PASS" actually proves (runtime, not config) |
 |---|---|---|
-| `model.default` / `model.provider` | §4 | Primary is a real provider, **not** silently `localhost` + `EMPTY` key |
+| `model.default` / `model.provider` | §5 | Primary is a real provider, **not** silently `localhost` + `EMPTY` key |
 | `mem.config` / `mem.binary` / `mem.db` | §9 | `provider: mnemosyne` **and** the `mnemosyne` binary resolves **and** the DB is non-trivial |
 | `backup.local` / `backup.offbox` | §12 | A recent `*.tar.zst.gpg` exists **and** the last off-box push returned `rc=0` |
 | `gw.run` / `gw.perms` | §7 | A gateway process is actually **running** for the account **and** no Discord `403 / 50013` in the logs |
@@ -1571,7 +1642,7 @@ so they don't clutter the happy path. Reach for a subsection only when its sympt
 | Symptom | Fix |
 |---|---|
 | `hermes` not found after install | `source ~/.bashrc`; confirm the installer added it to `PATH` |
-| Agent boots but is "dim" / weak reasoning | Bare `provider: custom` with no `custom_providers:` block silently ran the local model — see [§4.1](#41-the-silent-downgrade-trap--define-custom_providers-explicitly) |
+| Agent boots but is "dim" / weak reasoning | Bare `provider: custom` with no `custom_providers:` block silently ran the local model — see [§5.1](#51-define-custom_providers-explicitly) |
 | Model/provider errors | `hermes doctor`; check the API key in `~/.hermes/.env`; `hermes auth` for OAuth providers |
 | Discord bot **online but ignores messages** | Enable **Message Content Intent** — see [§17.2](#172-discord-gateway) |
 | Discord bot **can't pin / `403 Missing Permissions (50013)`** | Re-invite with a role granting `Manage Messages` — see [§17.2](#172-discord-gateway) |
