@@ -187,6 +187,8 @@ hermes chat -q "Say hello from the local model on the Spark."
 
 Now you can flip between local and hosted models by editing `model.provider` / `model.base_url` — the rest of your agent (skills, memory, gateway) is unaffected. This local endpoint is also what §5.2 uses as a failover target and what §9 uses as the memory-consolidation summarizer.
 
+> **Which model is "main"?** Setting `model.default: local-model` here gives you a fully self-contained agent that runs entirely on the box — the fastest way to confirm the whole stack works end-to-end. In [§5](#5-model--provider-wiring) you'll decide your *production* primary: many Spark setups run a frontier hosted model (e.g. Claude Opus) as `model.default` and keep this local endpoint as the **fallback** (§5.2) and auxiliary-task model (§5.3). Either choice is valid — §5 simply overwrites `model.default` with whichever you pick.
+
 ---
 
 ## 5. Model & Provider Wiring
