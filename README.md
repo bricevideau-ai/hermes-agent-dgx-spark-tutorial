@@ -187,7 +187,7 @@ hermes chat -q "Say hello from the local model on the Spark."
 
 Now you can flip between local and hosted models by editing `model.provider` / `model.base_url` — the rest of your agent (skills, memory, gateway) is unaffected. This local endpoint is also what §5.2 uses as a failover target and what §9 uses as the memory-consolidation summarizer.
 
-> **Which model is "main"?** Setting `model.default: local-model` here gives you a fully self-contained agent that runs entirely on the box — the fastest way to confirm the whole stack works end-to-end. In [§5](#5-model--provider-wiring) you'll decide your *production* primary: many Spark setups run a frontier hosted model (e.g. Claude Opus) as `model.default` and keep this local endpoint as the **fallback** (§5.2) and auxiliary-task model (§5.3). Either choice is valid — §5 simply overwrites `model.default` with whichever you pick.
+> **Which model is "main"?** Setting `model.default: local-model` here gives you a fully self-contained agent that runs entirely on the box — the fastest way to confirm the whole stack works end-to-end. In [§5](#5-model--provider-wiring) you'll decide your *production* primary: many Spark setups run a frontier hosted model (e.g. Claude Opus) as `model.default` and keep this local endpoint as a **fallback** (§5.2). Note that your main model choice also decides where housekeeping tasks run, since auxiliary tasks follow the main model by default (§5.3) — which matters if you benchmark on this GPU. Either choice is valid; §5 simply overwrites `model.default` with whichever you pick.
 
 ---
 
@@ -221,7 +221,7 @@ Avoid this by always declaring the provider explicitly and pointing `model.defau
 
 ```yaml
 model:
-  default: Claude Opus 4.8
+  default: Claude Opus 5
   provider: custom
   base_url: https://<your-gateway>/v1
   api_key: <your-key>
@@ -230,10 +230,10 @@ custom_providers:
   - name: Argo
     base_url: https://<your-gateway>/v1
     api_key: <your-key>
-    model: Claude Opus 4.8
+    model: Claude Opus 5
     api_mode: anthropic_messages   # Anthropic models — see the api_mode note below
     models:
-      - Claude Opus 4.8
+      - Claude Opus 5
       - Claude Sonnet 5
       # ...whatever the gateway serves
   - name: Local vLLM
@@ -276,17 +276,40 @@ A `200` with `content: null` is **not** working. Read the payload, not just the 
 
 Route everything through a single provider and you have a single point of failure: if the primary gateway drops, the agent dies — even with a local GPU sitting right there serving a model. Configure a `fallback_providers` chain so the agent survives an outage on a **different substrate**.
 
-`hermes fallback add` is an interactive picker (no scripting flags); its **"Custom endpoint (enter URL manually)"** option lets you point at `http://localhost:8000/v1`. Or declare it directly:
+`hermes fallback add` is an interactive picker (no scripting flags); its **"Custom endpoint (enter URL manually)"** option lets you point at `http://localhost:8000/v1`. Or declare it directly. This is the live chain on our box:
 
 ```yaml
+model:
+  default: Claude Opus 5
+  provider: argo-anthropic
+  base_url: http://127.0.0.1:8443/anthropic
+  api_mode: anthropic_messages
+
 fallback_providers:
-  - provider: custom
-    model: <local-model>
+  - provider: argo-openai            # hosted, different wire — does NOT touch the GPU
+    model: GPT-5.6 Sol
+    base_url: http://127.0.0.1:8443/v1
+    api_mode: chat_completions
+    api_key: <your-key>
+  - provider: custom                 # last resort: the local GPU
+    model: qwen
     base_url: http://localhost:8000/v1
     api_mode: chat_completions
 ```
 
-> **Design note:** a fallback to *another model on the same gateway* is worthless — when the gateway is down, both go down together. The only fallback that survives a gateway outage is one on a **different substrate**, i.e. the local GPU. Standing up the local LLM in §4 pays off twice: cheap inference *and* a real failover target.
+**Order the chain by what you are protecting.** The naive ordering puts the local GPU first because it's free. If you *benchmark* on that GPU, invert it: a hosted model goes first and the local endpoint is the last resort. Otherwise every hiccup on the primary silently dumps agent traffic onto the engine you are measuring, competing for the same sequence slots and corrupting the run. Redundancy and measurement isolation pull in opposite directions — pick deliberately.
+
+> **Design note:** a fallback to *another model on the same gateway* is worthless — when the gateway is down, both go down together. Keep at least one entry on a genuinely different substrate. Here the two hosted entries share a shim but are separate backends, and the local GPU remains as the bottom rung for a total hosted outage.
+
+**Authoring gotcha — `fallback_providers` is a list.** `hermes config set` writes a scalar or dict for list-valued keys, and the key is then silently ignored. Author it with `hermes config edit` (or a `$EDITOR` shim) and read it back as a real list:
+
+```bash
+hermes fallback                                  # renders the resolved chain, in order
+python3 -c 'import yaml,os;print(type(yaml.safe_load(open(os.path.expanduser("~/.hermes/config.yaml")))["fallback_providers"]))'
+# -> <class 'list'>   (anything else means the write did not take)
+```
+
+**Changes take effect on the next turn — no gateway restart.** The gateway re-reads `fallback_providers` from disk per turn and re-applies it to cached agents (`_refresh_fallback_model` / `_apply_fallback_chain_to_agent` in `gateway/run.py`). The one exception is documented in that code: the rewrite is skipped while a cooldown is holding an agent on an already-activated fallback.
 
 **Verify — force a real failover.** A fallback in the list is a hypothesis until you watch it catch. In an **isolated** config copy (never your live one), break only the top-level `model.base_url` and fire one query:
 
@@ -297,83 +320,43 @@ cp -r ~/.hermes "$HERMES_HOME"
 # port, e.g. http://127.0.0.1:59999/v1 (not the first base_url under
 # custom_providers — that's a different line and not the primary route).
 hermes chat -q "Reply exactly: FAILOVER-WORKS"
-# Expect: "🔄 Switched to fallback model: ... → <local-model> via custom" then the answer.
+# Expect: "🔄 Switched to fallback model: ... → GPT-5.6 Sol via argo-openai" then the answer.
 ```
 
-### 5.3 Fallback for auxiliary tasks (compression, title generation)
+> **`HERMES_HOME` in your shell defeats this test.** If `HERMES_HOME` is already exported (agent shells often have it set), a `HERMES_HOME=/tmp/... cmd` prefix does **not** isolate anything — the process still resolves the real home and you will "verify" your live config while believing it's a sandbox. Check with `echo "$HERMES_HOME"` first, and confirm the copy is actually in use before trusting the result.
 
-The main model isn't the only thing that calls out. Housekeeping tasks —
-conversation **compression** and **title generation** — run on their own model,
-configured under `auxiliary:`. On a Spark you'll want these on the cheap local
-model, but they must still work when the local server is down, so give each one
-its own `fallback_chain` to a hosted model.
+### 5.3 Auxiliary tasks (compression, title generation) follow your main model
 
-Point the primary at the local endpoint and the fallback at a **cheaper hosted
-model than your main** — there's no reason to spend a frontier model's rate on
-housekeeping. Here the main agent is Opus, so the auxiliary fallback is Sonnet:
-
-```yaml
-auxiliary:
-  compression:
-    provider: custom
-    model: <local-model>
-    base_url: http://localhost:8000/v1
-    api_key: local
-    timeout: 180
-    fallback_chain:
-      - provider: custom
-        model: Claude Sonnet 5
-        api_mode: anthropic_messages   # Claude fallback — Anthropic wire, NOT chat_completions
-        base_url: https://<your-gateway>/v1
-        api_key: <your-key>
-        timeout: 300
-  title_generation:
-    provider: custom
-    model: <local-model>
-    base_url: http://localhost:8000/v1
-    api_key: local
-    timeout: 60
-    fallback_chain:
-      - provider: custom
-        model: Claude Sonnet 5
-        api_mode: anthropic_messages   # Claude fallback — Anthropic wire, NOT chat_completions
-        base_url: https://<your-gateway>/v1
-        api_key: <your-key>
-        timeout: 300
-```
-
-Notes that bite if you skip them:
-
-- Both `provider: custom` **and** `base_url` are required on the primary and on
-  each fallback entry — a bare `base_url` without `provider: custom` won't
-  engage the fallback ladder.
-- **Set `api_mode: anthropic_messages` on every Claude fallback entry.** A
-  fallback entry inherits nothing from the main model's `api_mode`; omit it and
-  the entry defaults to `chat_completions`, which 403s on a Claude model (§5.1).
-  A fallback that fails the same way as the thing it's backing up is not a
-  fallback — prove it with the `/v1/messages` curl below.
-- `fallback_chain` is a YAML **block sequence** (a real list). `hermes config
-  set auxiliary.compression.fallback_chain '[...]'` stores a literal string, not
-  a list — author list-valued keys with `hermes config edit`, not `config set`.
-- Changes to `config.yaml` are read at process start: they take effect on the
-  **next gateway restart**, not live.
-
-**Verify.** Confirm the fallback model actually answers on your gateway before
-trusting it, then confirm the config parses as a list:
+Housekeeping tasks — conversation **compression** and **title generation** — do not run on the main agent loop. They resolve through a separate auxiliary router (`agent/auxiliary_client.py`), and **step 1 of that chain is your main provider + main model**. With no `auxiliary:` block in `config.yaml`, that is exactly what you get:
 
 ```bash
-# 1. Prove the fallback model completes on the gateway.
-#    Claude models use the Anthropic Messages endpoint (/v1/messages), NOT
-#    /v1/chat/completions — the same api_mode: anthropic_messages rule from §5.1.
-curl -s https://<your-gateway>/v1/messages \
-  -H "Authorization: Bearer ***" -H "Content-Type: application/json" \
-  -H "anthropic-version: 2023-06-01" \
-  -d '{"model":"Claude Sonnet 5","max_tokens":10,"messages":[{"role":"user","content":"say OK"}]}' \
-  | python3 -m json.tool
-
-# 2. Prove the config read back as a list, not a string:
-hermes config get auxiliary.compression.fallback_chain.0.model   # -> Claude Sonnet 5
+hermes config get model.default      # -> Claude Opus 5   (auxiliary tasks use this too)
 ```
+
+This is the current setup on our box: there is **no `auxiliary:` section at all**, so compression and titling run on Claude Opus 5 alongside the main loop, and never touch the local GPU.
+
+**Why leave it that way when benchmarking.** An `auxiliary:` block pointing at the local endpoint is the cheap choice, and it is the right one if you care about token spend. But it puts housekeeping traffic on the engine under measurement, at unpredictable times — a compression pass can fire mid-benchmark and contend for sequence slots. Letting auxiliary follow a hosted main model keeps the GPU clean for the measurement. Cheap vs. isolated is the tradeoff; decide it on purpose rather than by default.
+
+To pin auxiliary tasks somewhere specific instead, set a per-task override (`auxiliary.compression.*`, `auxiliary.title_generation.*`) with both `provider:` and `base_url:` — a bare `base_url` won't engage the ladder — and `api_mode: anthropic_messages` on every Claude entry, since a fallback entry inherits nothing from the main model's `api_mode` (§5.1). Like `fallback_providers`, `fallback_chain` is a block sequence: author it with `hermes config edit`, not `config set`.
+
+**Verify — prove where auxiliary actually went, don't infer it.** Hermes records per-task routing in its state DB, so you can read the truth rather than reason about the chain:
+
+```bash
+python3 - <<'EOF'
+import sqlite3, datetime, os
+db = os.path.expanduser("~/.hermes/state.db")
+c = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+q = """select task, model, billing_base_url, sum(api_call_count) calls, max(last_seen) seen
+       from session_model_usage
+       where task in ('title_generation','compression')
+       group by task, model, billing_base_url order by seen desc limit 10"""
+for task, model, url, calls, seen in c.execute(q):
+    ts = datetime.datetime.utcfromtimestamp(seen).strftime("%Y-%m-%d %H:%M")
+    print(f"{task:<18} {model:<32} {str(url)[:34]:<34} calls={calls:<5} {ts}")
+EOF
+```
+
+A row showing your local endpoint under `title_generation` while you believed auxiliary was hosted is the whole reason to run this — the config alone will not tell you.
 
 ---
 
@@ -1588,8 +1571,8 @@ Real output from this repo's reference box (`piment`), run against a live agent:
 ```
 === Hermes agent health check :: /home/<agent>/.hermes ===
 --- Axis 1: model/provider ---
-  [PASS] model.default = Claude Opus 4.8
-  [PASS] primary base_url set (https://.../argoapi/v1)
+  [PASS] model.default = Claude Opus 5
+  [PASS] primary base_url set (http://127.0.0.1:8443/anthropic)
 --- Axis 2: long-term memory (Mnemosyne) ---
   [PASS] memory provider = mnemosyne in config
   [PASS] mnemosyne CLI resolves (backend installed)
