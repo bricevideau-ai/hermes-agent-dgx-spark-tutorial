@@ -299,9 +299,9 @@ fallback_providers:
 
 **Order the chain by what you are protecting.** The naive ordering puts the local GPU first because it's free. If you *benchmark* on that GPU, invert it: a hosted model goes first and the local endpoint is the last resort. Otherwise every hiccup on the primary silently dumps agent traffic onto the engine you are measuring, competing for the same sequence slots and corrupting the run. Redundancy and measurement isolation pull in opposite directions — pick deliberately.
 
-> **Design note:** a fallback to *another model on the same gateway* is worthless — when the gateway is down, both go down together. Keep at least one entry on a genuinely different substrate. Here the two hosted entries share a shim but are separate backends, and the local GPU remains as the bottom rung for a total hosted outage.
+> **Design note:** a fallback to *another model on the same gateway* is worthless — when the gateway is down, both go down together. If both of your hosted entries reach the same gateway, only the local GPU is a genuinely independent substrate. Keep at least one entry there.
 
-**Authoring gotcha — `fallback_providers` is a list.** `hermes config set` writes a scalar or dict for list-valued keys, and the key is then silently ignored. Author it with `hermes config edit` (or a `$EDITOR` shim) and read it back as a real list:
+**Authoring gotcha — `fallback_providers` is a list.** `hermes config set` can *edit* an existing entry (`fallback_providers.0.model`) but cannot *append* one — a one-past-the-end index exits non-zero with `IndexError` and writes nothing. And setting the whole key to a plain string stores that string, silently replacing your list. Author the chain with `hermes config edit` (or an `$EDITOR` shim), then read it back as a real list:
 
 ```bash
 hermes fallback                                  # renders the resolved chain, in order
